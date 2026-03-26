@@ -1,0 +1,8 @@
+{
+  "name": "cc-swarm",
+  "description": "Peer-mesh multi-agent coordination over tmux",
+  "version": "0.1.0",
+  "author": {
+    "name": "Xiang Zheng"
+  }
+}
