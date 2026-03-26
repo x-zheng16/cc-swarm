@@ -1,20 +1,40 @@
-[
-  {
-    "event": "SessionStart",
-    "command": "SWARM_EVENT=SessionStart bash ${CLAUDE_PLUGIN_ROOT}/hooks/register-agent.sh",
-    "timeout": 5000,
-    "matcher": "*"
-  },
-  {
-    "event": "UserPromptSubmit",
-    "command": "SWARM_EVENT=UserPromptSubmit bash ${CLAUDE_PLUGIN_ROOT}/hooks/register-agent.sh",
-    "timeout": 5000,
-    "matcher": ""
-  },
-  {
-    "event": "Stop",
-    "command": "SWARM_EVENT=Stop bash ${CLAUDE_PLUGIN_ROOT}/hooks/register-agent.sh",
-    "timeout": 5000,
-    "matcher": "*"
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SWARM_EVENT=SessionStart bash ${CLAUDE_PLUGIN_ROOT}/hooks/register-agent.sh",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SWARM_EVENT=UserPromptSubmit bash ${CLAUDE_PLUGIN_ROOT}/hooks/register-agent.sh",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SWARM_EVENT=Stop bash ${CLAUDE_PLUGIN_ROOT}/hooks/register-agent.sh",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
   }
-]
+}
