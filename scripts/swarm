@@ -36,27 +36,48 @@ is_cc_pane() {
     local cmd title
     cmd=$($TMUX_BIN display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || echo "")
     title=$($TMUX_BIN display-message -t "$target" -p '#{pane_title}' 2>/dev/null || echo "")
-    # CC shows version as command (e.g. "2.1.81") — most reliable check
-    # Title "Claude Code" can be stale after CC exits, so only trust it if command is not a shell
-    [[ "$cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { [[ "$title" == *"Claude Code"* ]] && [[ "$cmd" != "zsh" && "$cmd" != "bash" && "$cmd" != "fish" ]]; }
+    # CC via compiled binary: command is a version number (e.g. "2.1.85")
+    [[ "$cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0
+    # CC via node (patched cli.js): command is "node", title has CC sparkle prefix
+    [[ "$cmd" == "node" && "$title" == *"✳"* ]] && return 0
+    # Fallback: "Claude Code" in title + not a shell
+    [[ "$title" == *"Claude Code"* && "$cmd" != "zsh" && "$cmd" != "bash" && "$cmd" != "fish" ]] && return 0
+    return 1
+}
+
+# Check if a CC process has active tool child processes (Bash tool running)
+# Normal CC children are all `node` (plugin workers, MCP servers).
+# /bin/zsh or /bin/bash children = Bash tool invocation.
+has_active_tools() {
+    local target="$1"
+    local pane_pid cc_pid
+    pane_pid=$($TMUX_BIN display-message -t "$target" -p '#{pane_pid}' 2>/dev/null || echo "")
+    [ -z "$pane_pid" ] && return 1
+
+    # Find CC child process (claude or node)
+    cc_pid=$(ps -ax -o pid=,ppid=,comm= 2>/dev/null | awk -v pp="$pane_pid" '$2==pp && ($3~/^claude$/ || $3~/^node$/) {print $1}' | head -1)
+    [ -z "$cc_pid" ] && return 1
+
+    # Check for non-node children (shell = Bash tool, caffeinate = long task, etc.)
+    local tool_procs
+    tool_procs=$(ps -ax -o pid=,ppid=,comm= 2>/dev/null | awk -v pp="$cc_pid" '$2==pp && $3!~/^node$/ {print $3}')
+    [ -n "$tool_procs" ]
 }
 
 # Get idle/busy status of a CC pane
-# Priority: hook-reported status (if fresh) > pane content heuristic
+# Priority: hook-reported (if fresh) > process tree > pane content heuristic
 get_status() {
     local target="$1"
     local safe_name
     safe_name=$(echo "$target" | tr ':.' '_')
 
-    # Check hook-reported status first (if updated within last 120s)
+    # 1. Check hook-reported status first (if updated within last 120s)
     if [ -f "$AGENTS_DIR/${safe_name}.json" ]; then
         local hook_status hook_time
         hook_status=$(jq -r '.status // empty' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
         hook_time=$(jq -r '.registered_at // empty' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
         if [ -n "$hook_status" ] && [ -n "$hook_time" ]; then
-            # Check freshness: parse ISO timestamp, compare with now
             local hook_epoch now_epoch
-            # BSD date (macOS) and GNU date (Linux) have different syntax
             if date -jf "%Y-%m-%dT%H:%M:%SZ" "$hook_time" "+%s" >/dev/null 2>&1; then
                 hook_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$hook_time" "+%s")
             elif date -d "$hook_time" "+%s" >/dev/null 2>&1; then
@@ -73,21 +94,22 @@ get_status() {
         fi
     fi
 
-    # Fallback: pane content heuristic
+    # 2. Process tree check: active tool children = busy
+    if has_active_tools "$target"; then
+        echo "busy"
+        return
+    fi
+
+    # 3. Fallback: pane content heuristic
     local last_lines
-    # Use strings to strip TUI decoration chars that break grep
     last_lines=$($TMUX_BIN capture-pane -t "$target" -p 2>/dev/null | strings | tail -15)
 
-    # Check for idle indicators
     if echo "$last_lines" | grep -qE '^\s*>|bypass permissions|permissions on|has exited'; then
         echo "idle"
-    # CC status bar (version + model + token count) = idle at prompt
     elif echo "$last_lines" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\s+(Opus|Sonnet|Haiku)'; then
         echo "idle"
-    # Tool usage summary line (e.g., "Bash:123 Edit:45") = just finished, idle
     elif echo "$last_lines" | grep -qE '(Bash|Read|Edit|Write|Grep|Glob|Agent):[0-9]+'; then
         echo "idle"
-    # CC TUI mode: box-drawing border chars (─) = idle at input prompt
     elif echo "$last_lines" | grep -q '─────'; then
         echo "idle"
     elif echo "$last_lines" | grep -qE 'Thinking|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|Processing|Running'; then
@@ -158,6 +180,29 @@ get_cwd() {
     $TMUX_BIN display-message -t "$target" -p '#{pane_current_path}' 2>/dev/null || echo ""
 }
 
+# Wait for CC to be fully ready in a pane (TUI visible, idle at prompt)
+# Detection: pane_current_command becomes a version number + status=idle
+wait_cc_ready() {
+    local target="$1"
+    local timeout="${2:-180}"
+    local elapsed=0
+
+    while [ $elapsed -lt $timeout ]; do
+        if is_cc_pane "$target"; then
+            local status
+            status=$(get_status "$target")
+            if [ "$status" = "idle" ]; then
+                return 0
+            fi
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+        printf "\r  [%3ds] waiting for CC ready in %s..." "$elapsed" "$target"
+    done
+    echo ""
+    return 1
+}
+
 # --- Commands ---
 
 cmd_list() {
@@ -169,7 +214,7 @@ cmd_list() {
         local target="${sess_name}:${win_idx}.${pane_idx}"
 
         # Check if this pane runs CC: version number as command or "Claude Code" in title
-        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
+        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$pane_cmd" == "node" && "$pane_title" == *"✳"* ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
             continue
         fi
 
@@ -466,7 +511,7 @@ cmd_status() {
 
     while IFS=$'\t' read -r sess_name win_idx pane_idx pane_cmd pane_title pane_path; do
         local target="${sess_name}:${win_idx}.${pane_idx}"
-        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
+        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$pane_cmd" == "node" && "$pane_title" == *"✳"* ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
             continue
         fi
 
@@ -497,7 +542,7 @@ cmd_register_all() {
 
     while IFS=$'\t' read -r sess_name win_idx pane_idx pane_cmd pane_title pane_path; do
         local target="${sess_name}:${win_idx}.${pane_idx}"
-        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
+        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$pane_cmd" == "node" && "$pane_title" == *"✳"* ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
             continue
         fi
 
@@ -603,6 +648,111 @@ EOF
     echo ""
     echo "Registered $count sessions."
     set -e  # Restore
+}
+
+cmd_launch() {
+    local session=""
+    local cc_cmd="cc"
+    local timeout=180
+    local count=1
+    local start_window=""
+    local agent_name=""
+    local model=""
+    local extra_args=()
+
+    # Parse args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session|-s)   session="$2";       shift 2 ;;
+            --cmd|-c)       cc_cmd="$2";        shift 2 ;;
+            --timeout|-t)   timeout="$2";       shift 2 ;;
+            --count)        count="$2";         shift 2 ;;
+            --window|-w)    start_window="$2";  shift 2 ;;
+            --name|-n)      agent_name="$2";    shift 2 ;;
+            --model|-m)     model="$2";         shift 2 ;;
+            --)             shift; extra_args+=("$@"); break ;;
+            *)
+                # Positional: session name
+                if [ -z "$session" ]; then
+                    session="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [ -z "$session" ]; then
+        echo "Error: session name required" >&2
+        echo "Usage: swarm launch <session> [--count N] [--name NAME] [--model MODEL] [--cmd cc|cc2] [--window W] [--timeout S] [-- extra-claude-args...]" >&2
+        exit 1
+    fi
+
+    # Verify tmux session exists
+    if ! $TMUX_BIN has-session -t "$session" 2>/dev/null; then
+        echo "Error: tmux session '$session' not found" >&2
+        exit 1
+    fi
+
+    local launched=0
+    local i=0
+    while [ $i -lt "$count" ]; do
+        i=$((i + 1))
+
+        # Build the cc command with extra args
+        local full_cmd="$cc_cmd"
+        # Determine name for this instance (auto-suffix for count > 1)
+        local instance_name=""
+        if [ -n "$agent_name" ]; then
+            if [ "$count" -gt 1 ]; then
+                instance_name="${agent_name}-${i}"
+            else
+                instance_name="$agent_name"
+            fi
+            full_cmd="$full_cmd -n '$instance_name'"
+        fi
+        if [ -n "$model" ]; then
+            full_cmd="$full_cmd --model $model"
+        fi
+        if [ ${#extra_args[@]} -gt 0 ]; then
+            for arg in "${extra_args[@]}"; do
+                full_cmd="$full_cmd '$arg'"
+            done
+        fi
+
+        # Create new tmux window (-d = don't steal focus)
+        local target
+        if [ -n "$start_window" ] && [ $i -eq 1 ]; then
+            target=$($TMUX_BIN new-window -d -t "${session}:${start_window}" -P -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) \
+                || target="${session}:${start_window}.0"
+        else
+            target=$($TMUX_BIN new-window -d -t "${session}" -P -F '#{session_name}:#{window_index}.#{pane_index}')
+        fi
+
+        # Rename tmux window if name provided
+        if [ -n "$instance_name" ]; then
+            local win_target="${target%.*}"
+            $TMUX_BIN rename-window -t "$win_target" "$instance_name" 2>/dev/null || true
+        fi
+
+        echo "[$i/$count] Launching in $target${instance_name:+ (name: $instance_name)}..."
+
+        # Send the cc command to the new shell
+        $TMUX_BIN send-keys -t "$target" "$full_cmd" Enter
+
+        # Wait for CC to be fully ready before launching next
+        if wait_cc_ready "$target" "$timeout"; then
+            echo ""
+            echo "  CC ready in $target"
+            launched=$((launched + 1))
+        else
+            echo ""
+            echo "  WARNING: CC did not become ready in $target within ${timeout}s" >&2
+            echo "  Continuing to next launch..." >&2
+        fi
+    done
+
+    echo ""
+    echo "Launched $launched/$count CC sessions in tmux session '$session'"
 }
 
 cmd_send() {
@@ -737,6 +887,14 @@ case "${1:-}" in
         shift
         cmd_inbox "$@"
         ;;
+    launch|l)
+        shift
+        if [ $# -lt 1 ]; then
+            echo "Usage: swarm launch <session> [--count N] [--cmd cc|cc2] [--window W] [--timeout S]" >&2
+            exit 1
+        fi
+        cmd_launch "$@"
+        ;;
     register-all|ra)
         cmd_register_all
         ;;
@@ -759,6 +917,7 @@ swarm — Peer-mesh multi-agent coordination over tmux
 
 Commands:
   list                              List all Claude Code sessions
+  launch <session> [options]        Launch CC sessions sequentially in tmux
   dispatch <target> <prompt>        Send prompt to a CC session
   dispatch <target> --file <path>   Send file reference (agent reads the file)
   monitor <target>                  Capture pane output
@@ -770,16 +929,29 @@ Commands:
   inbox [--peek] [--target <pane>]  Read (and clear) inbox messages
   run <dag.json> [options]          Execute a DAG workflow
 
+Launch options:
+  --name NAME, -n NAME              Name the agent (sets CC session name + tmux window name)
+  --model MODEL, -m MODEL           Model override (opus, sonnet, haiku)
+  --count N                         Number of sessions to launch (default: 1)
+  --cmd cc|cc2, -c cc|cc2           CC command to use (default: cc)
+  --window W, -w W                  Window index for first launch
+  --timeout S, -t S                 Max seconds to wait per session (default: 180)
+  -- [args...]                      Extra args passed through to claude CLI
+
 Run options:
   --resume                          Resume from existing state file
   --dry-run                         Validate and print plan without dispatching
   --poll-interval N                 Seconds between polls (default: 10)
   --timeout N                       Max seconds for DAG execution (default: 3600)
 
-Aliases: ls=list, d=dispatch, m=monitor, c=collect, s=status
+Aliases: ls=list, l=launch, d=dispatch, m=monitor, c=collect, s=status
 
 Examples:
   swarm list
+  swarm launch xz -n researcher           # Launch named agent
+  swarm launch xz -n worker --count 3    # Launch worker-1, worker-2, worker-3
+  swarm launch xz -n fast -m sonnet      # Launch with sonnet model
+  swarm launch xz --count 2 --cmd cc2    # Launch 2 sessions with cc2
   swarm dispatch cw:3.0 "Fix the heartbeat bug in uclaw"
   swarm dispatch xz:5.0 --file /tmp/long_task.md
   swarm monitor cw:3.0 --wait 300

@@ -19,6 +19,7 @@ No setup needed — just call it directly.
 | Command | What it does |
 | --- | --- |
 | `swarm list` | Show all CC sessions with status |
+| `swarm launch <session> [options]` | Launch CC sessions sequentially in tmux |
 | `swarm dispatch <target> "prompt"` | Send a prompt to another CC session |
 | `swarm dispatch <target> --file <path>` | Send a long prompt from file |
 | `swarm monitor <target> --wait 300` | Block until target finishes |
@@ -30,6 +31,45 @@ No setup needed — just call it directly.
 | `swarm run <dag.json>` | Execute a DAG workflow |
 | `swarm run <dag.json> --dry-run` | Validate DAG without dispatching |
 | `swarm run <dag.json> --resume` | Resume interrupted DAG |
+
+## Launching Sessions
+
+**Critical rule: CC sessions must be launched one at a time.**
+The `cc` / `cc2` command runs `_cc_launch()` which does git pulls and CC update checks.
+Concurrent launches cause race conditions.
+`swarm launch` enforces this by launching sequentially and waiting for each session to be ready before starting the next.
+
+### Readiness detection
+
+A CC session is "ready" when:
+1. `pane_current_command` becomes a version number (e.g. `2.1.81`) — CC process is running
+2. `get_status` returns `idle` — TUI is rendered with prompt visible (`>` or `─────` border)
+
+Both conditions must be true. `swarm launch` polls every 3 seconds until both are met (default timeout: 180s).
+
+### Launch examples
+
+```bash
+# Launch 1 CC session in tmux session "xz"
+swarm launch xz
+
+# Launch 3 CC sessions sequentially (waits for each to be ready)
+swarm launch xz --count 3
+
+# Use cc2 instead of cc
+swarm launch xz --count 2 --cmd cc2
+
+# Specify starting window index
+swarm launch xz --window 10 --count 4
+
+# Custom timeout (seconds per session)
+swarm launch xz --count 5 --timeout 240
+```
+
+### When to use launch vs pre-existing sessions
+
+- **Pre-existing**: for long-running agents that stay open across tasks
+- **Launch**: when spinning up fresh agents for a batch of work (e.g., DAG workflow, parallel research)
 
 ## Workflow
 
@@ -257,7 +297,7 @@ The executor:
 
 ## Important Notes
 
-- **Agents are pre-existing sessions.** You cannot launch new ones with swarm. They must already be running in tmux windows.
+- **Never launch CC sessions concurrently.** Use `swarm launch` which starts them one at a time, waiting for each to be ready. This avoids `_cc_launch` race conditions (git pull, CC update, repatch all conflict when run in parallel).
 - **Agents keep their own permissions.** Unlike claude-session-driver, you don't control their permission level.
 - **Use files for shared data.** Agents share the filesystem. Write to temp files for data exchange.
 - **Status detection is heuristic.** If status shows "unknown", the agent may be at an unusual prompt state.
