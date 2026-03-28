@@ -1,314 +1,251 @@
 ---
 name: swarm
-description: Coordinate with other Claude Code sessions running in tmux windows. Use when you need to delegate tasks to other agents, check their status, or collect their results.
+description: Coordinate with other Claude Code sessions running in tmux windows. Use when you need to delegate tasks to other agents, check their status, collect results, or request reviews.
 ---
 
-# CC Swarm — Multi-Agent Coordination
+# CC Swarm v2 -- Multi-Agent Coordination
 
 You can coordinate with other Claude Code sessions running in tmux windows using the `swarm` CLI.
-Each CC session is a peer agent.
-You can dispatch tasks, monitor progress, and collect results.
-
-## Setup
-
-`swarm` is on PATH (`~/.local/bin/swarm`).
-No setup needed — just call it directly.
+Each CC session is a peer agent in a full-mesh network.
+Teams and roles provide organizational structure, but any agent can talk to any other.
 
 ## Quick Reference
 
 | Command | What it does |
 | --- | --- |
 | `swarm list` | Show all CC sessions with status |
+| `swarm status` | Dashboard of all agents |
 | `swarm launch <session> [options]` | Launch CC sessions sequentially in tmux |
-| `swarm dispatch <target> "prompt"` | Send a prompt to another CC session |
-| `swarm dispatch <target> --file <path>` | Send a long prompt from file |
+| `swarm task create --id X --from P --to P` | Create a structured task |
+| `swarm task status <id>` | Show task state |
+| `swarm task list [--state S]` | List tasks, optionally filtered |
+| `swarm dispatch <target> --task <id>` | V2 dispatch with envelope validation |
+| `swarm dispatch <target> "prompt"` | V1 dispatch (simple, no tracking) |
+| `swarm dispatch <target> --file <path>` | V1 dispatch from file |
+| `swarm review <task_id> --reviewer <pane>` | Request cross-agent review |
 | `swarm monitor <target> --wait 300` | Block until target finishes |
 | `swarm collect <target>` | Get last assistant response text |
-| `swarm status` | Dashboard of all agents |
-| `swarm send <target> "msg"` | Send async message to agent's inbox |
-| `swarm inbox` | Read and clear your inbox |
-| `swarm inbox --peek` | Read inbox without clearing |
+| `swarm card [<target>]` | Show agent card |
+| `swarm card set-role <target> <role>` | Set role (worker, lead, monitor) |
+| `swarm card set-team <target> <team>` | Assign to team |
+| `swarm card set-caps <target> <c1,c2>` | Set capabilities |
+| `swarm team list\|create\|add\|show\|delete` | Team management |
+| `swarm topology` | Show full topology |
+| `swarm send <target> "msg"` | Async message to inbox |
+| `swarm inbox [--peek]` | Read your inbox |
 | `swarm run <dag.json>` | Execute a DAG workflow |
-| `swarm run <dag.json> --dry-run` | Validate DAG without dispatching |
-| `swarm run <dag.json> --resume` | Resume interrupted DAG |
+| `swarm monitor-start [--session S]` | Launch the monitor agent |
+| `swarm monitor-status` | Show monitor report |
 
-## Launching Sessions
+## Identity and Teams
 
-**Critical rule: CC sessions must be launched one at a time.**
-The `cc` / `cc2` command runs `_cc_launch()` which does git pulls and CC update checks.
-Concurrent launches cause race conditions.
-`swarm launch` enforces this by launching sequentially and waiting for each session to be ready before starting the next.
+Every agent has a card at `~/.claude-swarm/agents/{pane}.json` with:
+- `role`: worker (default), lead, or monitor
+- `team`: team name (e.g., "research-safety")
+- `capabilities`: what you can do (e.g., ["research", "paper-writing"])
+- `current_task`: task_id you are working on (set by dispatch, cleared on idle)
 
-### Readiness detection
+Check your own card: `swarm card` (auto-detects your pane).
 
-A CC session is "ready" when:
-1. `pane_current_command` becomes a version number (e.g. `2.1.81`) — CC process is running
-2. `get_status` returns `idle` — TUI is rendered with prompt visible (`>` or `─────` border)
+Teams are defined in `~/.claude-swarm/topology.json`.
+Team leads can spawn new agents.
+The monitor is a special agent that watches all others.
 
-Both conditions must be true. `swarm launch` polls every 3 seconds until both are met (default timeout: 180s).
+You have full mesh capability: you can talk to any agent regardless of team.
+Teams are organizational, not communication boundaries.
 
-### Launch examples
+## Receiving Tasks
 
-```bash
-# Launch 1 CC session in tmux session "xz"
-swarm launch xz
+When you receive a task via `swarm dispatch --task`:
 
-# Launch 3 CC sessions sequentially (waits for each to be ready)
-swarm launch xz --count 3
+1. You see: `Read and execute the task in ~/.claude-swarm/tasks/{task_id}/prompt.md`
+2. Read `prompt.md` for instructions.
+3. Read `envelope.json` from the same directory for metadata (who sent it, what type, where to write results).
+4. **Verify relevance**: does this task match your session's purpose? If not, reject it and notify the sender.
+5. Execute the task.
+6. Write your output to the `result_path` specified in envelope.json.
+7. Go idle. The system detects completion automatically.
 
-# Use cc2 instead of cc
-swarm launch xz --count 2 --cmd cc2
+## Sending Tasks (V2 Protocol)
 
-# Specify starting window index
-swarm launch xz --window 10 --count 4
-
-# Custom timeout (seconds per session)
-swarm launch xz --count 5 --timeout 240
-```
-
-### When to use launch vs pre-existing sessions
-
-- **Pre-existing**: for long-running agents that stay open across tasks
-- **Launch**: when spinning up fresh agents for a batch of work (e.g., DAG workflow, parallel research)
-
-## Workflow
-
-### 1. Find available agents
+The structured way to delegate work:
 
 ```bash
-swarm list
+# 1. Create the task
+swarm task create --id 20260328_analyze_data \
+    --from mbp:1.0 --to mbp:5.0 \
+    --type task --prompt "Analyze experiment results in /tmp/data.json"
+
+# 2. Dispatch
+swarm dispatch mbp:5.0 --task 20260328_analyze_data
+
+# 3. Wait
+swarm monitor mbp:5.0 --wait 600
+
+# 4. Read result
+cat ~/.claude-swarm/tasks/20260328_analyze_data/result.md
 ```
 
-Output shows pane target (e.g., `cw:3.0`), status (idle/busy), session ID, and working directory.
-
-### 2. Dispatch a task
+For quick, untracked tasks, V1 dispatch still works:
 
 ```bash
-swarm dispatch cw:3.0 "Run the test suite for uclaw and report any failures"
+swarm dispatch mbp:5.0 "Run the test suite and report failures"
 ```
 
-For long prompts, write to a file first:
+### Task Lifecycle
+
+```
+created -> dispatched -> running -> completed | failed | stuck
+```
+
+The CLI manages transitions.
+Status is tracked in `~/.claude-swarm/tasks/{task_id}/status.json`.
+Check with: `swarm task status <task_id>`.
+
+### Task ID Convention
+
+Format: `{YYYYMMDD}_{slug}` (e.g., `20260328_poisoned_skill_draft`).
+Review rounds: append `_review_r1`, `_r2`, etc.
+
+## Review Exchange
+
+**NEVER review your own work.**
+Generator-evaluator separation is critical.
+Always dispatch reviews to a different agent.
 
 ```bash
-cat > /tmp/task.md << 'EOF'
-Your detailed task description here...
-EOF
-swarm dispatch cw:3.0 --file /tmp/task.md
+# Request a review of your completed task
+swarm review 20260328_my_draft --reviewer mbp:14.0
+
+# With custom artifact (review something outside the task dir)
+swarm review 20260328_my_draft --reviewer mbp:14.0 \
+    --artifact ~/projects/research/paper/main.tex
 ```
 
-The command checks if the target is idle before sending.
-Use `--force` to send to a busy agent.
+This creates `20260328_my_draft_review_r1` and dispatches it to the reviewer.
+If r1 exists, it auto-creates r2, r3, etc.
 
-### 3. Wait for completion
+### Review Format
 
-```bash
-swarm monitor cw:3.0 --wait 600
+When reviewing, write your output to `result_path` with this structure:
+
+```markdown
+# Review: {what you reviewed}
+
+## Verdict: MAJOR_REVISION | MINOR_REVISION | ACCEPT
+
+## Critical Issues (must fix)
+1. ...
+
+## Important Issues (should fix)
+1. ...
+
+## Minor Issues (nice to fix)
+1. ...
+
+## Strengths
+1. ...
+
+## Summary
+One paragraph assessment.
 ```
 
-Polls every 5 seconds until the agent returns to idle (max 600s = 10 min).
+### Review Flow
 
-### 4. Collect the result
-
-```bash
-RESULT=$(swarm collect cw:3.0)
-echo "$RESULT"
+```
+Author finishes work
+  -> swarm review <task_id> --reviewer <other_agent>
+Reviewer reads artifact, writes structured review
+  -> swarm send <author> "Review done, read result_path"
+Author reads review, revises
+  -> If needed: swarm review <task_id> --reviewer <other_agent>  (creates _r2)
 ```
 
-Extracts the last assistant text response from the agent's session JSONL log.
+## Sprint Contracts
 
-## Common Patterns
+Before a large task, establish expectations with your dispatcher:
+- What exactly is the deliverable?
+- Where does it go (result_path)?
+- What quality bar?
+- What timeout?
 
-### Fan-Out: Parallel tasks
-
-```bash
-# Find idle agents
-swarm list
-
-# Dispatch to multiple agents
-swarm dispatch cw:3.0 "Task A"
-swarm dispatch cw:5.0 "Task B"
-swarm dispatch xz:4.0 "Task C"
-
-# Wait for all to finish
-swarm monitor cw:3.0 --wait 600
-swarm monitor cw:5.0 --wait 600
-swarm monitor xz:4.0 --wait 600
-
-# Collect results
-RESULT_A=$(swarm collect cw:3.0)
-RESULT_B=$(swarm collect cw:5.0)
-RESULT_C=$(swarm collect xz:4.0)
-```
-
-### Pipeline: Sequential handoff
-
-```bash
-# Step 1: Agent A generates data
-swarm dispatch cw:3.0 "Generate test fixtures and save to /tmp/fixtures.json"
-swarm monitor cw:3.0 --wait 300
-
-# Step 2: Agent B processes the data
-swarm dispatch cw:5.0 "Read /tmp/fixtures.json and run validation tests"
-swarm monitor cw:5.0 --wait 300
-
-RESULT=$(swarm collect cw:5.0)
-```
-
-### Supervised: Check before continuing
-
-```bash
-swarm dispatch cw:3.0 "Analyze the auth module for security issues"
-swarm monitor cw:3.0 --wait 600
-
-# Check what it found before proceeding
-ANALYSIS=$(swarm collect cw:3.0)
-# Based on analysis, decide next steps
-```
+Write the agreement into prompt.md so both parties share the same expectations.
+This prevents the common failure: agent does great work, but not what was asked.
 
 ## Async Mailbox
 
-For non-blocking communication between agents.
-Unlike dispatch (which types into the agent's prompt), send drops a message in the target's inbox for later reading.
-
-### Send a message
+For non-blocking messages between agents.
 
 ```bash
-swarm send cw:3.0 "Results are ready at /tmp/analysis.json"
-```
-
-### Check your inbox
-
-```bash
+swarm send mbp:5.0 "Results ready at /tmp/analysis.json"
 swarm inbox            # read and clear
 swarm inbox --peek     # read without clearing
 ```
 
-### Example: Coordinator notifies workers
+## Monitor Agent
+
+A dedicated CC session watches all agents and proactively helps.
+Launch it: `swarm monitor-start`.
+Check its report: `swarm monitor-status`.
+
+If you are stuck, you can ask the monitor for help:
 
 ```bash
-# Write shared data
-echo "task complete" > /tmp/shared_state.json
-
-# Notify all workers (non-blocking)
-swarm send cw:3.0 "Shared state updated, check /tmp/shared_state.json"
-swarm send cw:5.0 "Shared state updated, check /tmp/shared_state.json"
+swarm send mbp:monitor.0 "I am stuck on: <describe issue>"
 ```
 
-Workers check their inbox at their own pace via `swarm inbox`.
+If the monitor sends you a message, treat it as a suggestion, not a command.
+It observes and nudges; it does not have authority over you.
 
-## DAG Workflow: Declarative Task Orchestration
+## DAG Workflows
 
-Instead of manually chaining dispatch/monitor/collect, declare dependencies in a `dag.json` and let swarm handle scheduling.
-
-### dag.json format
+Declare task dependencies in JSON, let swarm handle scheduling:
 
 ```json
 {
   "id": "my-workflow",
   "max_parallel": 3,
   "tasks": {
-    "design": {
-      "target": "xz:1.0",
-      "prompt": "Design the auth system architecture"
-    },
-    "api": {
-      "target": "xz:2.0",
-      "prompt_file": "~/.cc-swarm/tasks/api/prompt.md",
-      "depends_on": ["design"],
-      "outputs": ["src/auth/api.py"]
-    },
-    "frontend": {
-      "target": "cw:3.0",
-      "prompt": "Build login UI components",
-      "depends_on": ["design"]
-    },
-    "integration": {
-      "target": "xz:1.0",
-      "prompt": "Write integration tests",
-      "depends_on": ["api", "frontend"],
-      "join": "and"
-    }
+    "design":    {"target": "mbp:1.0", "prompt": "Design the system"},
+    "implement": {"target": "mbp:2.0", "depends_on": ["design"], "outputs": ["src/main.py"]},
+    "test":      {"target": "mbp:3.0", "depends_on": ["design"]},
+    "integrate": {"target": "mbp:1.0", "depends_on": ["implement", "test"], "join": "and"}
   }
 }
 ```
-
-Task fields:
-- `target` (required): tmux pane to dispatch to
-- `prompt` or `prompt_file` (required): inline text or path to prompt file
-- `depends_on` (optional): list of task names that must complete first
-- `join` (optional): `"and"` (default: wait for ALL deps) or `"or"` (start when ANY dep completes)
-- `outputs` (optional): files that must exist after completion (validates success)
-
-### Run a DAG
 
 ```bash
-# Validate without dispatching
-swarm run workflow.json --dry-run
-
-# Execute
-swarm run workflow.json
-
-# Resume after interruption (skips completed tasks)
-swarm run workflow.json --resume
-
-# Custom timeout and poll interval
-swarm run workflow.json --timeout 7200 --poll-interval 15
+swarm run workflow.json --dry-run   # validate
+swarm run workflow.json             # execute
+swarm run workflow.json --resume    # resume after interruption
 ```
 
-The executor:
-1. Validates the DAG (cycle detection, missing deps)
-2. Dispatches tasks with no dependencies first
-3. Polls running tasks every 10s
-4. Dispatches downstream tasks as dependencies complete
-5. Skips tasks whose dependencies failed
-6. Saves state to `*_state.json` for resume capability
+## Important Rules
 
-### Example: Research Pipeline
+- **Target by window NAME**, never by index. Indices shift when windows are rearranged.
+- **Fresh window per task.** Never dispatch to a window with an existing active session.
+- **File reference for long prompts.** Use `--file` or `--task`, never paste raw.
+- **Files for shared data.** Agents share the filesystem. Write to files for data exchange.
+- **Sequential launches only.** `swarm launch` enforces this. Never launch CC sessions in parallel.
+- **Context resets over compaction.** If your context is getting large, write state to files and ask for a fresh session with a continuation prompt.
+- **Status is heuristic.** If `swarm status` shows "unknown", the agent may be at an unusual state.
 
-```json
-{
-  "id": "paper-survey",
-  "max_parallel": 4,
-  "tasks": {
-    "search_papers": {
-      "target": "xz:2.0",
-      "prompt_file": "~/.cc-swarm/tasks/search/prompt.md",
-      "outputs": ["~/cc_tmp/papers.json"]
-    },
-    "analyze_methods": {
-      "target": "cw:3.0",
-      "prompt": "Read ~/cc_tmp/papers.json and analyze methods",
-      "depends_on": ["search_papers"]
-    },
-    "analyze_results": {
-      "target": "xz:4.0",
-      "prompt": "Read ~/cc_tmp/papers.json and compare results",
-      "depends_on": ["search_papers"]
-    },
-    "write_summary": {
-      "target": "xz:2.0",
-      "prompt": "Write survey summary combining methods and results analysis",
-      "depends_on": ["analyze_methods", "analyze_results"],
-      "join": "and"
-    }
-  }
-}
+## Launching Sessions
+
+```bash
+swarm launch xz --count 3             # 3 sessions in xz
+swarm launch xz -n researcher         # named agent
+swarm launch xz --cmd cc2 --count 2   # use cc2 account
+swarm launch xz -n worker -m sonnet   # with model override
 ```
 
-## Important Notes
-
-- **Never launch CC sessions concurrently.** Use `swarm launch` which starts them one at a time, waiting for each to be ready. This avoids `_cc_launch` race conditions (git pull, CC update, repatch all conflict when run in parallel).
-- **Agents keep their own permissions.** Unlike claude-session-driver, you don't control their permission level.
-- **Use files for shared data.** Agents share the filesystem. Write to temp files for data exchange.
-- **Status detection is heuristic.** If status shows "unknown", the agent may be at an unusual prompt state.
-- **Collect reads the session JSONL.** The agent must be registered (SessionStart hook) for collect to work. If not registered, it falls back to pane capture.
+Sessions launch one at a time (180s timeout each).
+Readiness: version number visible + idle status detected.
 
 ## Targeting
 
-Targets use tmux pane addressing: `session_name:window_index.pane_index`
+Targets use tmux pane addressing: `session:window.pane`
 
-Examples:
-- `cw:3.0` — session "cw", window 3, pane 0
-- `xz:1.0` — session "xz", window 1, pane 0
+Examples: `mbp:5.0`, `xz:researcher.0`
 
 Run `swarm list` to see all valid targets.

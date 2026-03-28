@@ -16,17 +16,19 @@
 
 set -euo pipefail
 
-SWARM_DIR="$HOME/.claude-swarm"
+SWARM_DIR="${SWARM_DIR:-$HOME/.claude-swarm}"
 AGENTS_DIR="$SWARM_DIR/agents"
 DISPATCH_DIR="$SWARM_DIR/dispatches"
 MAILBOX_DIR="$SWARM_DIR/mailbox"
+TASKS_DIR="$SWARM_DIR/tasks"
+TOPOLOGY_FILE="$SWARM_DIR/topology.json"
 if command -v brew >/dev/null 2>&1; then
     TMUX_BIN="$(brew --prefix)/bin/tmux"
 else
     TMUX_BIN="tmux"
 fi
 
-mkdir -p "$AGENTS_DIR" "$DISPATCH_DIR" "$MAILBOX_DIR"
+mkdir -p "$AGENTS_DIR" "$DISPATCH_DIR" "$MAILBOX_DIR" "$TASKS_DIR"
 
 # --- Utility functions ---
 
@@ -842,19 +844,1026 @@ cmd_inbox() {
     fi
 }
 
+# --- Task lifecycle (v2) ---
+
+cmd_task() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        create) cmd_task_create "$@" ;;
+        status) cmd_task_status "$@" ;;
+        list)   cmd_task_list "$@" ;;
+        *)
+            echo "Usage: swarm task <create|status|list> [args]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_task_create() {
+    local task_id="" from="" to="" type="task" priority="normal" timeout=1800
+    local result_path="" phase="default" prompt_text=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --id)           task_id="$2"; shift 2 ;;
+            --from)         from="$2"; shift 2 ;;
+            --to)           to="$2"; shift 2 ;;
+            --type)         type="$2"; shift 2 ;;
+            --priority)     priority="$2"; shift 2 ;;
+            --timeout)      timeout="$2"; shift 2 ;;
+            --result-path)  result_path="$2"; shift 2 ;;
+            --phase)        phase="$2"; shift 2 ;;
+            --prompt)       prompt_text="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    # Validate required fields
+    if [ -z "$task_id" ]; then
+        echo "Error: --id is required" >&2
+        exit 1
+    fi
+    if [ -z "$from" ]; then
+        echo "Error: --from is required" >&2
+        exit 1
+    fi
+    if [ -z "$to" ]; then
+        echo "Error: --to is required" >&2
+        exit 1
+    fi
+
+    # Check for duplicates
+    local task_dir="$TASKS_DIR/$task_id"
+    if [ -d "$task_dir" ]; then
+        echo "Error: task '$task_id' already exists" >&2
+        exit 1
+    fi
+
+    mkdir -p "$task_dir"
+
+    # Default result_path
+    if [ -z "$result_path" ]; then
+        result_path="$TASKS_DIR/$task_id/result.md"
+    fi
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Write envelope.json
+    jq -n \
+        --arg task_id "$task_id" \
+        --arg from "$from" \
+        --arg to "$to" \
+        --arg type "$type" \
+        --arg sent_at "$timestamp" \
+        --arg result_path "$result_path" \
+        --arg priority "$priority" \
+        --argjson timeout "$timeout" \
+        --arg phase "$phase" \
+        '{
+            version: 2,
+            task_id: $task_id,
+            from: $from,
+            to: $to,
+            type: $type,
+            sent_at: $sent_at,
+            result_path: $result_path,
+            priority: $priority,
+            timeout: $timeout,
+            phase: $phase
+        }' > "$task_dir/envelope.json"
+
+    # Write status.json
+    jq -n \
+        --arg task_id "$task_id" \
+        --arg state "created" \
+        --arg created_at "$timestamp" \
+        '{
+            task_id: $task_id,
+            state: $state,
+            created_at: $created_at,
+            transitions: [{from: "init", to: "created", at: $created_at}]
+        }' > "$task_dir/status.json"
+
+    # Write prompt.md if provided
+    if [ -n "$prompt_text" ]; then
+        echo "$prompt_text" > "$task_dir/prompt.md"
+    fi
+
+    echo "Task created: $task_id"
+    echo "  Dir: $task_dir"
+}
+
+cmd_task_status() {
+    local task_id="${1:-}"
+    if [ -z "$task_id" ]; then
+        echo "Usage: swarm task status <task_id>" >&2
+        exit 1
+    fi
+
+    local task_dir="$TASKS_DIR/$task_id"
+    if [ ! -d "$task_dir" ]; then
+        echo "Error: task '$task_id' not found" >&2
+        exit 1
+    fi
+
+    local state from to type
+    state=$(jq -r '.state' "$task_dir/status.json")
+    from=$(jq -r '.from' "$task_dir/envelope.json")
+    to=$(jq -r '.to' "$task_dir/envelope.json")
+    type=$(jq -r '.type' "$task_dir/envelope.json")
+
+    printf "Task:   %s\n" "$task_id"
+    printf "State:  %s\n" "$state"
+    printf "Type:   %s\n" "$type"
+    printf "From:   %s\n" "$from"
+    printf "To:     %s\n" "$to"
+
+    # Show result_path and whether result exists
+    local result_path
+    result_path=$(jq -r '.result_path' "$task_dir/envelope.json")
+    local rp_expanded
+    rp_expanded=$(echo "$result_path" | sed "s|^~|$HOME|")
+    if [ -f "$rp_expanded" ]; then
+        printf "Result: %s (exists)\n" "$result_path"
+    else
+        printf "Result: %s (pending)\n" "$result_path"
+    fi
+}
+
+cmd_task_list() {
+    local filter_state=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --state) filter_state="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ ! -d "$TASKS_DIR" ] || [ -z "$(ls -A "$TASKS_DIR" 2>/dev/null)" ]; then
+        echo "No tasks found"
+        return 0
+    fi
+
+    printf "%-35s %-12s %-8s %-18s %-18s\n" "TASK_ID" "STATE" "TYPE" "FROM" "TO"
+    printf "%-35s %-12s %-8s %-18s %-18s\n" "-------" "-----" "----" "----" "--"
+
+    for task_dir in "$TASKS_DIR"/*/; do
+        [ -d "$task_dir" ] || continue
+        [ -f "$task_dir/status.json" ] || continue
+        [ -f "$task_dir/envelope.json" ] || continue
+
+        local task_id state type from to
+        task_id=$(basename "$task_dir")
+        state=$(jq -r '.state' "$task_dir/status.json")
+        type=$(jq -r '.type' "$task_dir/envelope.json")
+        from=$(jq -r '.from' "$task_dir/envelope.json")
+        to=$(jq -r '.to' "$task_dir/envelope.json")
+
+        if [ -n "$filter_state" ] && [ "$state" != "$filter_state" ]; then
+            continue
+        fi
+
+        printf "%-35s %-12s %-8s %-18s %-18s\n" "$task_id" "$state" "$type" "$from" "$to"
+    done
+}
+
+# --- Agent card (v2) ---
+
+cmd_card() {
+    local subcmd="${1:-}"
+
+    case "$subcmd" in
+        set-role) shift; cmd_card_set "$@" "role" ;;
+        set-team) shift; cmd_card_set "$@" "team" ;;
+        set-caps) shift; cmd_card_set_caps "$@" ;;
+        *)
+            # Show card for target
+            local target="${subcmd:-}"
+            if [ -z "$target" ]; then
+                # Auto-detect from tmux
+                if [ -n "${TMUX:-}" ]; then
+                    target=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "")
+                fi
+                if [ -z "$target" ]; then
+                    echo "Usage: swarm card <target> | swarm card set-role|set-team|set-caps <target> <value>" >&2
+                    exit 1
+                fi
+            fi
+            local safe_name
+            safe_name=$(echo "$target" | tr ':.' '_')
+            local card_file="$AGENTS_DIR/${safe_name}.json"
+            if [ ! -f "$card_file" ]; then
+                echo "Error: no agent card for $target" >&2
+                exit 1
+            fi
+            jq . "$card_file"
+            ;;
+    esac
+}
+
+cmd_card_set() {
+    local target="$1"
+    local value="$2"
+    local field="$3"
+
+    if [ -z "$target" ] || [ -z "$value" ]; then
+        echo "Usage: swarm card set-$field <target> <value>" >&2
+        exit 1
+    fi
+
+    local safe_name
+    safe_name=$(echo "$target" | tr ':.' '_')
+    local card_file="$AGENTS_DIR/${safe_name}.json"
+
+    if [ ! -f "$card_file" ]; then
+        echo "Error: no agent card for $target" >&2
+        exit 1
+    fi
+
+    jq --arg v "$value" --arg f "$field" '.[$f] = $v' "$card_file" > "$card_file.tmp" \
+        && mv "$card_file.tmp" "$card_file"
+    echo "Set $field=$value for $target"
+}
+
+cmd_card_set_caps() {
+    local target="$1"
+    local caps_csv="$2"
+
+    if [ -z "$target" ] || [ -z "$caps_csv" ]; then
+        echo "Usage: swarm card set-caps <target> <cap1,cap2,...>" >&2
+        exit 1
+    fi
+
+    local safe_name
+    safe_name=$(echo "$target" | tr ':.' '_')
+    local card_file="$AGENTS_DIR/${safe_name}.json"
+
+    if [ ! -f "$card_file" ]; then
+        echo "Error: no agent card for $target" >&2
+        exit 1
+    fi
+
+    # Convert CSV to JSON array
+    local caps_json
+    caps_json=$(echo "$caps_csv" | tr ',' '\n' | jq -R . | jq -s .)
+
+    jq --argjson caps "$caps_json" '.capabilities = $caps' "$card_file" > "$card_file.tmp" \
+        && mv "$card_file.tmp" "$card_file"
+    echo "Set capabilities for $target"
+}
+
+# --- V2 Dispatch Protocol ---
+
+cmd_dispatch_v2() {
+    local task_id=""
+    local force=false
+
+    # Parse args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --task)
+                task_id="$2"
+                shift 2
+                ;;
+            --force)
+                force=true
+                shift
+                ;;
+            *)
+                echo "Error: unknown option for v2 dispatch: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$task_id" ]; then
+        echo "Error: --task requires a task_id" >&2
+        exit 1
+    fi
+
+    # 1. Validate task directory exists
+    local task_dir="$TASKS_DIR/$task_id"
+    if [ ! -d "$task_dir" ]; then
+        echo "Error: task '$task_id' not found (no directory at $task_dir)" >&2
+        exit 1
+    fi
+
+    # 2. Validate envelope.json exists
+    if [ ! -f "$task_dir/envelope.json" ]; then
+        echo "Error: envelope.json missing in $task_dir" >&2
+        exit 1
+    fi
+
+    # 3. Validate prompt.md exists
+    if [ ! -f "$task_dir/prompt.md" ]; then
+        echo "Error: prompt.md missing in $task_dir — create task with --prompt or write it manually" >&2
+        exit 1
+    fi
+
+    # 4. Read and validate envelope required fields
+    local env_task_id env_from env_to
+    env_task_id=$(jq -r '.task_id // empty' "$task_dir/envelope.json")
+    env_from=$(jq -r '.from // empty' "$task_dir/envelope.json")
+    env_to=$(jq -r '.to // empty' "$task_dir/envelope.json")
+
+    if [ -z "$env_task_id" ]; then
+        echo "Error: envelope.json missing required field 'task_id'" >&2
+        exit 1
+    fi
+    if [ -z "$env_from" ]; then
+        echo "Error: envelope.json missing required field 'from'" >&2
+        exit 1
+    fi
+    if [ -z "$env_to" ]; then
+        echo "Error: envelope.json missing required field 'to'" >&2
+        exit 1
+    fi
+
+    local target="$env_to"
+
+    # 5. Update status.json: state -> dispatched, add dispatched_at and transition
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local prev_state
+    prev_state=$(jq -r '.state' "$task_dir/status.json")
+
+    jq --arg ts "$timestamp" --arg prev "$prev_state" '
+        .state = "dispatched" |
+        .dispatched_at = $ts |
+        .transitions += [{from: $prev, to: "dispatched", at: $ts}]
+    ' "$task_dir/status.json" > "$task_dir/status.json.tmp" \
+        && mv "$task_dir/status.json.tmp" "$task_dir/status.json"
+
+    # 6. Update the target agent's card: set current_task
+    local safe_target
+    safe_target=$(echo "$target" | tr ':.' '_')
+    local card_file="$AGENTS_DIR/${safe_target}.json"
+    if [ -f "$card_file" ]; then
+        jq --arg tid "$task_id" '.current_task = $tid' "$card_file" > "$card_file.tmp" \
+            && mv "$card_file.tmp" "$card_file"
+    fi
+
+    # 7. Dispatch via tmux (skip if no tmux — e.g. test environment)
+    if [ -z "${TMUX:-}" ] && ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
+        echo "V2 dispatch prepared: task=$task_id target=$target (tmux unavailable, skipping paste)"
+        return 0
+    fi
+
+    # Validate tmux target
+    if ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
+        echo "Error: tmux session '${target%%:*}' not found" >&2
+        echo "Available sessions:" >&2
+        $TMUX_BIN list-sessions -F '  #{session_name}' 2>/dev/null >&2
+        exit 1
+    fi
+
+    # Check if CC is running
+    if ! is_cc_pane "$target"; then
+        echo "Error: $target does not appear to be running Claude Code" >&2
+        exit 1
+    fi
+
+    # Check idle status
+    local status
+    status=$(get_status "$target")
+    if [ "$status" = "busy" ] && [ "$force" != "true" ]; then
+        echo "Warning: $target appears busy (status: $status). Use --force to send anyway." >&2
+        exit 1
+    fi
+
+    # Send dispatch message: read and execute the task prompt
+    local abs_prompt_path="$task_dir/prompt.md"
+    local dispatch_msg="Read and execute the task in $abs_prompt_path"
+    local buf_name="swarm_$$_$(date +%s%N)"
+
+    echo "$dispatch_msg" | $TMUX_BIN load-buffer -b "$buf_name" -
+    $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d
+
+    # Send Enter
+    sleep 0.3
+    $TMUX_BIN send-keys -t "$target" Enter
+
+    # Log
+    local safe_log
+    safe_log=$(echo "$target" | tr ':.' '_')
+    local log_file="$DISPATCH_DIR/$(date +%Y%m%d_%H%M%S)_${safe_log}.json"
+    cat > "$log_file" <<EOF
+{
+  "target": "$target",
+  "task_id": "$task_id",
+  "timestamp": "$timestamp",
+  "content": "(task: $task_id)",
+  "status_at_dispatch": "$status",
+  "version": 2
+}
+EOF
+
+    echo "V2 dispatched: task=$task_id -> $target (was: $status)"
+    echo "Log: $log_file"
+}
+
+# --- Topology helpers ---
+
+# Ensure topology.json exists with base structure
+_init_topology() {
+    if [ ! -f "$TOPOLOGY_FILE" ]; then
+        cat > "$TOPOLOGY_FILE" <<'EOF'
+{
+  "teams": {},
+  "special_agents": {},
+  "spawn_permissions": {}
+}
+EOF
+    fi
+}
+
+# --- Team management (v2) ---
+
+cmd_team() {
+    local subcmd="${1:-}"
+    shift || true
+
+    case "$subcmd" in
+        create) cmd_team_create "$@" ;;
+        add)    cmd_team_add "$@" ;;
+        remove) cmd_team_remove "$@" ;;
+        show)   cmd_team_show "$@" ;;
+        list)   cmd_team_list "$@" ;;
+        delete) cmd_team_delete "$@" ;;
+        *)
+            echo "Usage: swarm team <create|add|remove|show|list|delete> [args]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_team_create() {
+    local name="" lead="" desc=""
+
+    # First positional arg is team name
+    if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+        name="$1"
+        shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --lead)  lead="$2"; shift 2 ;;
+            --desc)  desc="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        echo "Error: team name is required" >&2
+        echo "Usage: swarm team create <name> --lead <pane> [--desc \"...\"]" >&2
+        exit 1
+    fi
+    if [ -z "$lead" ]; then
+        echo "Error: --lead is required" >&2
+        echo "Usage: swarm team create <name> --lead <pane> [--desc \"...\"]" >&2
+        exit 1
+    fi
+
+    _init_topology
+
+    # Check for duplicate team
+    if [ "$(jq --arg n "$name" '.teams | has($n)' "$TOPOLOGY_FILE")" = "true" ]; then
+        echo "Error: team '$name' already exists" >&2
+        exit 1
+    fi
+
+    # Add team to topology
+    jq --arg n "$name" --arg l "$lead" --arg d "$desc" \
+        '.teams[$n] = {lead: $l, members: [], description: $d}' \
+        "$TOPOLOGY_FILE" > "$TOPOLOGY_FILE.tmp" \
+        && mv "$TOPOLOGY_FILE.tmp" "$TOPOLOGY_FILE"
+
+    echo "Team created: $name (lead: $lead)"
+}
+
+cmd_team_add() {
+    local name="${1:-}"
+    local pane="${2:-}"
+
+    if [ -z "$name" ] || [ -z "$pane" ]; then
+        echo "Usage: swarm team add <name> <pane>" >&2
+        exit 1
+    fi
+
+    _init_topology
+
+    # Check team exists
+    if [ "$(jq --arg n "$name" '.teams | has($n)' "$TOPOLOGY_FILE")" != "true" ]; then
+        echo "Error: team '$name' not found" >&2
+        exit 1
+    fi
+
+    # Check duplicate member
+    if [ "$(jq --arg n "$name" --arg p "$pane" '.teams[$n].members | index($p) != null' "$TOPOLOGY_FILE")" = "true" ]; then
+        echo "Error: '$pane' is already a member of team '$name'" >&2
+        exit 1
+    fi
+
+    # Add member
+    jq --arg n "$name" --arg p "$pane" \
+        '.teams[$n].members += [$p]' \
+        "$TOPOLOGY_FILE" > "$TOPOLOGY_FILE.tmp" \
+        && mv "$TOPOLOGY_FILE.tmp" "$TOPOLOGY_FILE"
+
+    echo "Added $pane to team $name"
+}
+
+cmd_team_remove() {
+    local name="${1:-}"
+    local pane="${2:-}"
+
+    if [ -z "$name" ] || [ -z "$pane" ]; then
+        echo "Usage: swarm team remove <name> <pane>" >&2
+        exit 1
+    fi
+
+    _init_topology
+
+    # Check team exists
+    if [ "$(jq --arg n "$name" '.teams | has($n)' "$TOPOLOGY_FILE")" != "true" ]; then
+        echo "Error: team '$name' not found" >&2
+        exit 1
+    fi
+
+    # Check member exists
+    if [ "$(jq --arg n "$name" --arg p "$pane" '.teams[$n].members | index($p) != null' "$TOPOLOGY_FILE")" != "true" ]; then
+        echo "Error: '$pane' is not a member of team '$name'" >&2
+        exit 1
+    fi
+
+    # Remove member
+    jq --arg n "$name" --arg p "$pane" \
+        '.teams[$n].members = [.teams[$n].members[] | select(. != $p)]' \
+        "$TOPOLOGY_FILE" > "$TOPOLOGY_FILE.tmp" \
+        && mv "$TOPOLOGY_FILE.tmp" "$TOPOLOGY_FILE"
+
+    echo "Removed $pane from team $name"
+}
+
+cmd_team_show() {
+    local name="${1:-}"
+
+    if [ -z "$name" ]; then
+        echo "Usage: swarm team show <name>" >&2
+        exit 1
+    fi
+
+    _init_topology
+
+    if [ "$(jq --arg n "$name" '.teams | has($n)' "$TOPOLOGY_FILE")" != "true" ]; then
+        echo "Error: team '$name' not found" >&2
+        exit 1
+    fi
+
+    local lead desc members_count
+    lead=$(jq -r --arg n "$name" '.teams[$n].lead' "$TOPOLOGY_FILE")
+    desc=$(jq -r --arg n "$name" '.teams[$n].description // ""' "$TOPOLOGY_FILE")
+    members_count=$(jq -r --arg n "$name" '.teams[$n].members | length' "$TOPOLOGY_FILE")
+
+    printf "Team:        %s\n" "$name"
+    printf "Lead:        %s\n" "$lead"
+    [ -n "$desc" ] && printf "Description: %s\n" "$desc"
+    printf "Members:     %s\n" "$members_count"
+
+    if [ "$members_count" -gt 0 ]; then
+        jq -r --arg n "$name" '.teams[$n].members[]' "$TOPOLOGY_FILE" | while read -r m; do
+            printf "  - %s\n" "$m"
+        done
+    fi
+}
+
+cmd_team_list() {
+    _init_topology
+
+    local team_count
+    team_count=$(jq '.teams | keys | length' "$TOPOLOGY_FILE")
+
+    if [ "$team_count" -eq 0 ]; then
+        echo "No teams defined"
+        return 0
+    fi
+
+    printf "%-20s %-20s %-8s %s\n" "TEAM" "LEAD" "MEMBERS" "DESCRIPTION"
+    printf "%-20s %-20s %-8s %s\n" "----" "----" "-------" "-----------"
+
+    jq -r '.teams | to_entries[] | [.key, .value.lead, (.value.members | length | tostring), (.value.description // "")] | @tsv' \
+        "$TOPOLOGY_FILE" | while IFS=$'\t' read -r name lead count desc; do
+        printf "%-20s %-20s %-8s %s\n" "$name" "$lead" "$count" "$desc"
+    done
+}
+
+cmd_team_delete() {
+    local name="${1:-}"
+
+    if [ -z "$name" ]; then
+        echo "Usage: swarm team delete <name>" >&2
+        exit 1
+    fi
+
+    _init_topology
+
+    if [ "$(jq --arg n "$name" '.teams | has($n)' "$TOPOLOGY_FILE")" != "true" ]; then
+        echo "Error: team '$name' not found" >&2
+        exit 1
+    fi
+
+    jq --arg n "$name" 'del(.teams[$n])' \
+        "$TOPOLOGY_FILE" > "$TOPOLOGY_FILE.tmp" \
+        && mv "$TOPOLOGY_FILE.tmp" "$TOPOLOGY_FILE"
+
+    echo "Team deleted: $name"
+}
+
+# --- Topology display ---
+
+cmd_topology() {
+    if [ ! -f "$TOPOLOGY_FILE" ]; then
+        echo "No topology defined (run 'swarm team create' first)"
+        return 0
+    fi
+
+    local team_count
+    team_count=$(jq '.teams | keys | length' "$TOPOLOGY_FILE")
+
+    if [ "$team_count" -eq 0 ]; then
+        echo "No topology defined (no teams)"
+        return 0
+    fi
+
+    echo "=== Swarm Topology ==="
+    echo ""
+
+    # Teams
+    jq -r '.teams | to_entries[] | .key' "$TOPOLOGY_FILE" | while read -r team_name; do
+        local lead desc members_count
+        lead=$(jq -r --arg n "$team_name" '.teams[$n].lead' "$TOPOLOGY_FILE")
+        desc=$(jq -r --arg n "$team_name" '.teams[$n].description // ""' "$TOPOLOGY_FILE")
+        members_count=$(jq -r --arg n "$team_name" '.teams[$n].members | length' "$TOPOLOGY_FILE")
+
+        printf "[%s] lead=%s" "$team_name" "$lead"
+        [ -n "$desc" ] && printf " — %s" "$desc"
+        echo ""
+
+        if [ "$members_count" -gt 0 ]; then
+            jq -r --arg n "$team_name" '.teams[$n].members[]' "$TOPOLOGY_FILE" | while read -r m; do
+                printf "  %s\n" "$m"
+            done
+        fi
+    done
+
+    # Special agents
+    local special_count
+    special_count=$(jq '.special_agents | keys | length' "$TOPOLOGY_FILE")
+    if [ "$special_count" -gt 0 ]; then
+        echo ""
+        echo "Special agents:"
+        jq -r '.special_agents | to_entries[] | "  \(.key): \(.value)"' "$TOPOLOGY_FILE"
+    fi
+
+    # Spawn permissions
+    local spawn_count
+    spawn_count=$(jq '.spawn_permissions | keys | length' "$TOPOLOGY_FILE")
+    if [ "$spawn_count" -gt 0 ]; then
+        echo ""
+        echo "Spawn permissions:"
+        jq -r '.spawn_permissions | to_entries[] | "  \(.key): \(.value)"' "$TOPOLOGY_FILE"
+    fi
+}
+
+# --- Review Exchange Protocol (v2) ---
+
+cmd_review() {
+    local source_task_id="" reviewer="" artifact_path=""
+
+    # Parse positional + flags
+    if [ $# -ge 1 ] && [[ "$1" != --* ]]; then
+        source_task_id="$1"
+        shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reviewer)   reviewer="$2"; shift 2 ;;
+            --artifact)   artifact_path="$2"; shift 2 ;;
+            *) echo "Error: unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    # Validate required args
+    if [ -z "$source_task_id" ]; then
+        echo "Error: source task_id is required" >&2
+        echo "Usage: swarm review <task_id> --reviewer <pane> [--artifact <path>]" >&2
+        exit 1
+    fi
+    if [ -z "$reviewer" ]; then
+        echo "Error: --reviewer is required" >&2
+        echo "Usage: swarm review <task_id> --reviewer <pane> [--artifact <path>]" >&2
+        exit 1
+    fi
+
+    # 1. Validate source task exists
+    local source_dir="$TASKS_DIR/$source_task_id"
+    if [ ! -d "$source_dir" ]; then
+        echo "Error: source task '$source_task_id' not found (no directory at $source_dir)" >&2
+        exit 1
+    fi
+
+    # 2. Determine artifact to review
+    if [ -z "$artifact_path" ]; then
+        # Default: use result.md from source task, or result_path from envelope
+        local env_result_path=""
+        if [ -f "$source_dir/envelope.json" ]; then
+            env_result_path=$(jq -r '.result_path // empty' "$source_dir/envelope.json")
+        fi
+        if [ -n "$env_result_path" ] && [ -f "$env_result_path" ]; then
+            artifact_path="$env_result_path"
+        elif [ -f "$source_dir/result.md" ]; then
+            artifact_path="$source_dir/result.md"
+        else
+            echo "Error: source task has no result.md and no --artifact specified" >&2
+            echo "Hint: write a result to $source_dir/result.md or pass --artifact <path>" >&2
+            exit 1
+        fi
+    fi
+
+    # 3. Determine round number (auto-increment)
+    local round=1
+    while [ -d "$TASKS_DIR/${source_task_id}_review_r${round}" ]; do
+        round=$((round + 1))
+    done
+
+    local review_task_id="${source_task_id}_review_r${round}"
+    local review_dir="$TASKS_DIR/$review_task_id"
+
+    # 4. Read author from source envelope (the 'to' field is who did the work)
+    local author=""
+    if [ -f "$source_dir/envelope.json" ]; then
+        author=$(jq -r '.to // empty' "$source_dir/envelope.json")
+    fi
+    if [ -z "$author" ]; then
+        author="unknown"
+    fi
+
+    # 5. Create review task via task create
+    "$0" task create \
+        --id "$review_task_id" \
+        --from "$author" \
+        --to "$reviewer" \
+        --type "review" \
+        --prompt "__placeholder__"
+
+    # 6. Update envelope with result_path pointing to review.md
+    local review_result_path="$review_dir/review.md"
+    jq --arg rp "$review_result_path" '.result_path = $rp' \
+        "$review_dir/envelope.json" > "$review_dir/envelope.json.tmp" \
+        && mv "$review_dir/envelope.json.tmp" "$review_dir/envelope.json"
+
+    # 7. Generate proper prompt.md with review instructions
+    cat > "$review_dir/prompt.md" <<REVIEW_PROMPT
+# Review Request: ${source_task_id} (Round ${round})
+
+## Artifact to Review
+
+\`${artifact_path}\`
+
+Read the artifact above and write your review to: \`${review_result_path}\`
+
+## Review Format
+
+Structure your review with these sections:
+
+### Verdict
+ACCEPT / REVISE / REJECT — one word, then a one-sentence justification.
+
+### Critical Issues
+Blocking problems that must be fixed. If none, write "None."
+
+### Important Issues
+Significant concerns that should be addressed. If none, write "None."
+
+### Minor Issues
+Small improvements, style nits, typos. If none, write "None."
+
+### Strengths
+What works well — be specific.
+
+### Summary
+2-3 sentence overall assessment.
+REVIEW_PROMPT
+
+    # 8. Dispatch the review task (best-effort: task files are already created)
+    if "$0" dispatch --task "$review_task_id" 2>/dev/null; then
+        : # dispatch succeeded
+    else
+        # Tmux may be unavailable or target unreachable -- task is still ready
+        # Manually update status to dispatched since dispatch didn't complete
+        local timestamp
+        timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        local prev_state
+        prev_state=$(jq -r '.state' "$review_dir/status.json")
+        if [ "$prev_state" != "dispatched" ]; then
+            jq --arg ts "$timestamp" --arg prev "$prev_state" '
+                .state = "dispatched" |
+                .dispatched_at = $ts |
+                .transitions += [{from: $prev, to: "dispatched", at: $ts}]
+            ' "$review_dir/status.json" > "$review_dir/status.json.tmp" \
+                && mv "$review_dir/status.json.tmp" "$review_dir/status.json"
+        fi
+    fi
+
+    echo "Review task created: $review_task_id (round $round)"
+    echo "  Reviewing: $artifact_path"
+    echo "  Reviewer: $reviewer"
+    echo "  Result: $review_result_path"
+}
+
+# --- Monitor agent ---
+
+MONITOR_DIR="$SWARM_DIR/monitor"
+
+cmd_monitor_start() {
+    local session=""
+    local dry_run=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session|-s) session="$2"; shift 2 ;;
+            --dry-run)    dry_run=true; shift ;;
+            *)
+                if [ -z "$session" ]; then
+                    session="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Create monitor directory and initial status
+    mkdir -p "$MONITOR_DIR"
+    echo "[swarm monitor: starting] $(date '+%Y-%m-%d %H:%M')" > "$MONITOR_DIR/status.txt"
+
+    if [ "$dry_run" = "true" ]; then
+        echo "Dry run: monitor directory created at $MONITOR_DIR"
+        echo "Dry run: status.txt initialized"
+        echo "Dry run: would launch CC session and dispatch monitor.md prompt"
+        return 0
+    fi
+
+    # Detect session from topology special_agents.monitor or use provided/default
+    if [ -z "$session" ]; then
+        if [ -f "$TOPOLOGY_FILE" ]; then
+            local topo_monitor
+            topo_monitor=$(jq -r '.special_agents.monitor // empty' "$TOPOLOGY_FILE" 2>/dev/null)
+            if [ -n "$topo_monitor" ]; then
+                session="${topo_monitor%%:*}"
+            fi
+        fi
+    fi
+
+    if [ -z "$session" ]; then
+        if [ -n "${TMUX:-}" ]; then
+            session=$($TMUX_BIN display-message -p '#{session_name}' 2>/dev/null || echo "")
+        fi
+    fi
+
+    if [ -z "$session" ]; then
+        echo "Error: no session specified and cannot auto-detect" >&2
+        echo "Usage: swarm monitor-start [<session>] [--dry-run]" >&2
+        exit 1
+    fi
+
+    # Verify tmux session exists
+    if ! $TMUX_BIN has-session -t "$session" 2>/dev/null; then
+        echo "Error: tmux session '$session' not found" >&2
+        exit 1
+    fi
+
+    # Resolve the monitor.md template path
+    local script_src="$0"
+    while [ -L "$script_src" ]; do script_src="$(readlink "$script_src")"; done
+    local script_dir
+    script_dir="$(cd "$(dirname "$script_src")" && pwd -P)"
+    local template_path="${script_dir}/../agents/monitor.md"
+    if [ ! -f "$template_path" ]; then
+        echo "Error: monitor template not found at $template_path" >&2
+        exit 1
+    fi
+
+    # Launch a CC session named "monitor"
+    echo "Launching monitor agent in session '$session'..."
+    cmd_launch "$session" --name monitor --count 1
+
+    # Find the monitor pane
+    local monitor_target=""
+    monitor_target=$($TMUX_BIN list-panes -t "${session}" -a -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null \
+        | grep ':monitor\.' | head -1)
+
+    if [ -z "$monitor_target" ]; then
+        monitor_target=$($TMUX_BIN list-panes -t "${session}" -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+            | tail -1)
+    fi
+
+    if [ -z "$monitor_target" ]; then
+        echo "Error: failed to locate the monitor pane" >&2
+        exit 1
+    fi
+
+    # Register monitor in topology
+    if [ -f "$TOPOLOGY_FILE" ]; then
+        jq --arg t "$monitor_target" '.special_agents.monitor = $t' \
+            "$TOPOLOGY_FILE" > "$TOPOLOGY_FILE.tmp" \
+            && mv "$TOPOLOGY_FILE.tmp" "$TOPOLOGY_FILE"
+    fi
+
+    # Update status
+    echo "[swarm monitor: launched] $(date '+%Y-%m-%d %H:%M') pane=$monitor_target" > "$MONITOR_DIR/status.txt"
+
+    # Dispatch the monitor prompt
+    local abs_template
+    abs_template=$(cd "$(dirname "$template_path")" && echo "$(pwd -P)/$(basename "$template_path")")
+    cmd_dispatch "$monitor_target" --file "$abs_template"
+
+    echo "Monitor agent started: $monitor_target"
+    echo "Template: $abs_template"
+    echo "Status: $MONITOR_DIR/status.txt"
+}
+
+cmd_monitor_status() {
+    local status_file="$MONITOR_DIR/status.txt"
+
+    if [ ! -f "$status_file" ]; then
+        echo "Error: No monitor status found — monitor is not running" >&2
+        echo "Start the monitor with: swarm monitor-start [session]" >&2
+        exit 1
+    fi
+
+    if [ ! -s "$status_file" ]; then
+        echo "Error: Monitor status file is empty — monitor may not be running" >&2
+        exit 1
+    fi
+
+    echo "=== Swarm Monitor Status ==="
+    echo ""
+    cat "$status_file"
+
+    # Show monitor pane target if available in topology
+    if [ -f "$TOPOLOGY_FILE" ]; then
+        local monitor_pane
+        monitor_pane=$(jq -r '.special_agents.monitor // empty' "$TOPOLOGY_FILE" 2>/dev/null)
+        if [ -n "$monitor_pane" ]; then
+            echo ""
+            echo "Monitor pane: $monitor_pane"
+        fi
+    fi
+}
+
 # --- Main ---
 
 case "${1:-}" in
+    task)
+        shift
+        cmd_task "$@"
+        ;;
+    card)
+        shift
+        cmd_card "$@"
+        ;;
+    team)
+        shift
+        cmd_team "$@"
+        ;;
+    topology)
+        cmd_topology
+        ;;
+    review)
+        shift
+        cmd_review "$@"
+        ;;
     list|ls)
         cmd_list
         ;;
     dispatch|d)
         shift
-        if [ $# -lt 2 ]; then
-            echo "Usage: swarm dispatch <target> <prompt|--file path>" >&2
-            exit 1
+        # V2 dispatch: --task flag takes a task_id (target comes from envelope)
+        if [ "${1:-}" = "--task" ]; then
+            cmd_dispatch_v2 "$@"
+        else
+            if [ $# -lt 2 ]; then
+                echo "Usage: swarm dispatch <target> <prompt|--file path|--task task_id>" >&2
+                exit 1
+            fi
+            cmd_dispatch "$@"
         fi
-        cmd_dispatch "$@"
         ;;
     monitor|m)
         shift
@@ -898,6 +1907,14 @@ case "${1:-}" in
     register-all|ra)
         cmd_register_all
         ;;
+    monitor-start)
+        shift
+        cmd_monitor_start "$@"
+        ;;
+    monitor-status)
+        shift
+        cmd_monitor_status "$@"
+        ;;
     run)
         shift
         if [ $# -lt 1 ]; then
@@ -920,6 +1937,15 @@ Commands:
   launch <session> [options]        Launch CC sessions sequentially in tmux
   dispatch <target> <prompt>        Send prompt to a CC session
   dispatch <target> --file <path>   Send file reference (agent reads the file)
+  dispatch <target> --task <id>    V2 dispatch with envelope validation
+  task create --id X --from --to   Create a structured task with envelope
+  task status <id>                 Show task state
+  task list [--state S]            List tasks, optionally filtered by state
+  review <task_id> --reviewer <p>  Request cross-agent review
+  card [<target>]                  Show agent card (auto-detect if no target)
+  card set-role <target> <role>    Set agent role
+  card set-team <target> <team>    Assign agent to team
+  card set-caps <target> <c1,c2>   Set agent capabilities
   monitor <target>                  Capture pane output
   monitor <target> --wait [timeout] Wait until session is idle
   monitor <target> --tail <n>       Last n lines
@@ -927,6 +1953,15 @@ Commands:
   status                            Dashboard of all agents
   send <target> <message>           Send async message to agent's inbox
   inbox [--peek] [--target <pane>]  Read (and clear) inbox messages
+  team create <name> --lead <pane>  Create a team
+  team add <name> <pane>            Add member to team
+  team remove <name> <pane>         Remove member from team
+  team show <name>                  Show team details
+  team list                         List all teams
+  team delete <name>                Delete a team
+  topology                          Pretty-print full topology
+  monitor-start [session] [--dry-run]  Launch the monitor watchdog agent
+  monitor-status                    Show monitor agent's latest report
   run <dag.json> [options]          Execute a DAG workflow
 
 Launch options:
@@ -959,6 +1994,8 @@ Examples:
   swarm send cw:3.0 "Results ready at /tmp/output.json"
   swarm inbox
   swarm status
+  swarm monitor-start mbp                # Launch monitor in session mbp
+  swarm monitor-status                   # Check monitor's latest report
   swarm run workflow.json --dry-run
   swarm run workflow.json --resume --timeout 7200
 USAGE
