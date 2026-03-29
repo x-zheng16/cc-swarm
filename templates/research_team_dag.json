@@ -1,0 +1,81 @@
+{
+  "id": "research_{PROJECT_ID}",
+  "description": "Full research team DAG: planner -> 4 execution agents -> reviewer",
+  "max_parallel": 4,
+  "vars": {
+    "PROJECT_ID": "REPLACE_ME",
+    "TASK_DIR": "~/.claude-swarm/tasks/{PROJECT_ID}",
+    "PAPER_DIR": "~/projects/research/{PROJECT_ID}/paper/drafts",
+    "PLANNER": "mbp:planner.0",
+    "STORY_WRITER": "mbp:story-writer.0",
+    "SURVEY_AGENT": "mbp:survey-agent.0",
+    "METHOD_WRITER": "mbp:method-writer.0",
+    "EXPERIMENT_AGENT": "mbp:experiment-agent.0",
+    "REVIEWER": "mbp:reviewer.0"
+  },
+  "tasks": {
+    "plan": {
+      "target": "{PLANNER}",
+      "prompt_file": "{TASK_DIR}/prompts/plan.md",
+      "outputs": [
+        "{TASK_DIR}/plan.md",
+        "{TASK_DIR}/qa_log.md"
+      ]
+    },
+    "survey": {
+      "target": "{SURVEY_AGENT}",
+      "prompt_file": "{TASK_DIR}/prompts/survey.md",
+      "depends_on": ["plan"],
+      "outputs": [
+        "{PAPER_DIR}/related_work.tex",
+        "{TASK_DIR}/baselines.md",
+        "{TASK_DIR}/target_papers.md"
+      ]
+    },
+    "method": {
+      "target": "{METHOD_WRITER}",
+      "prompt_file": "{TASK_DIR}/prompts/method.md",
+      "depends_on": ["plan"],
+      "outputs": [
+        "{PAPER_DIR}/method.tex"
+      ]
+    },
+    "story_draft": {
+      "target": "{STORY_WRITER}",
+      "prompt_file": "{TASK_DIR}/prompts/story.md",
+      "depends_on": ["plan"],
+      "outputs": [
+        "{PAPER_DIR}/introduction.tex",
+        "{PAPER_DIR}/abstract.tex"
+      ]
+    },
+    "experiments": {
+      "target": "{EXPERIMENT_AGENT}",
+      "prompt_file": "{TASK_DIR}/prompts/experiments.md",
+      "depends_on": ["method", "survey"],
+      "join": "and",
+      "outputs": [
+        "{PAPER_DIR}/experiments.tex",
+        "{TASK_DIR}/EXPERIMENT_LOG.md"
+      ]
+    },
+    "story_final": {
+      "target": "{STORY_WRITER}",
+      "prompt_file": "{TASK_DIR}/prompts/story_final.md",
+      "depends_on": ["experiments", "method"],
+      "join": "and",
+      "outputs": [
+        "{PAPER_DIR}/conclusion.tex"
+      ]
+    },
+    "review_r1": {
+      "target": "{REVIEWER}",
+      "prompt_file": "{TASK_DIR}/prompts/review.md",
+      "depends_on": ["story_final", "experiments", "survey"],
+      "join": "and",
+      "outputs": [
+        "{TASK_DIR}/review_r1.md"
+      ]
+    }
+  }
+}
