@@ -21,6 +21,7 @@ AGENTS_DIR="$SWARM_DIR/agents"
 DISPATCH_DIR="$SWARM_DIR/dispatches"
 MAILBOX_DIR="$SWARM_DIR/mailbox"
 TASKS_DIR="$SWARM_DIR/tasks"
+QA_DIR="$SWARM_DIR/qa"
 TOPOLOGY_FILE="$SWARM_DIR/topology.json"
 if command -v brew >/dev/null 2>&1; then
     TMUX_BIN="$(brew --prefix)/bin/tmux"
@@ -208,15 +209,30 @@ wait_cc_ready() {
 # --- Commands ---
 
 cmd_list() {
-    printf "%-15s %-8s %-40s %s\n" "PANE" "STATUS" "SESSION_ID" "CWD"
-    printf "%-15s %-8s %-40s %s\n" "----" "------" "----------" "---"
+    local verbose=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--verbose) verbose=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if $verbose; then
+        printf "%-15s %-8s %-30s %-40s %s\n" "PANE" "STATUS" "NAME" "SESSION_ID" "CWD"
+        printf "%-15s %-8s %-30s %-40s %s\n" "----" "------" "----" "----------" "---"
+    else
+        printf "%-15s %-8s %-30s %s\n" "PANE" "STATUS" "NAME" "CWD"
+        printf "%-15s %-8s %-30s %s\n" "----" "------" "----" "---"
+    fi
 
     # Scan all tmux panes
     while IFS=$'\t' read -r sess_name win_idx pane_idx pane_cmd pane_title pane_path; do
         local target="${sess_name}:${win_idx}.${pane_idx}"
 
-        # Check if this pane runs CC: version number as command or "Claude Code" in title
-        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$pane_cmd" == "node" && "$pane_title" == *"✳"* ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
+        # Check if this pane is a registered CC session (agent card exists from hook)
+        local safe_name
+        safe_name=$(echo "$target" | tr ':.' '_')
+        if [ ! -f "$SWARM_DIR/agents/${safe_name}.json" ]; then
             continue
         fi
 
@@ -226,14 +242,21 @@ cmd_list() {
         sid=$(get_session_id "$target")
         local cwd="$pane_path"
 
-        # Shorten session ID for display
-        local short_sid="${sid:0:36}"
-        [ -z "$short_sid" ] && short_sid="(unregistered)"
+        # Extract session name from pane title (strip leading status icons like ⠐ ✳)
+        local name
+        name=$(echo "$pane_title" | sed 's/^[^a-zA-Z]*//' | cut -c1-28)
+        [ -z "$name" ] && name="(unnamed)"
 
         # Shorten CWD
         local display_cwd="${cwd/#$HOME/~}"
 
-        printf "%-15s %-8s %-40s %s\n" "$target" "$status" "$short_sid" "$display_cwd"
+        if $verbose; then
+            local short_sid="${sid:0:36}"
+            [ -z "$short_sid" ] && short_sid="(unregistered)"
+            printf "%-15s %-8s %-30s %-40s %s\n" "$target" "$status" "$name" "$short_sid" "$display_cwd"
+        else
+            printf "%-15s %-8s %-30s %s\n" "$target" "$status" "$name" "$display_cwd"
+        fi
     done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_index}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
 }
 
@@ -841,6 +864,164 @@ cmd_inbox() {
     if [ "$clear" = "true" ]; then
         > "$inbox_file"
         echo "(inbox cleared)"
+    fi
+}
+
+# --- QA protocol ---
+
+cmd_ask() {
+    local target="$1"
+    shift
+    local question="$*"
+
+    if [ -z "$target" ] || [ -z "$question" ]; then
+        echo "Usage: swarm ask <target> \"question\"" >&2
+        exit 1
+    fi
+
+    mkdir -p "$QA_DIR"
+
+    # Get sender identity
+    local sender="unknown"
+    if [ -n "${TMUX:-}" ]; then
+        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "unknown")
+    fi
+
+    # Generate QA ID: qa_{timestamp}_{short_hash}
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local short_ts
+    short_ts=$(date -u +"%Y%m%d_%H%M%S")
+    local hash
+    hash=$(echo "${sender}_${target}_${short_ts}" | shasum | cut -c1-6)
+    local qa_id="qa_${short_ts}_${hash}"
+
+    # Create QA record
+    local qa_file="$QA_DIR/${qa_id}.json"
+    jq -n \
+        --arg id "$qa_id" \
+        --arg from "$sender" \
+        --arg to "$target" \
+        --arg question "$question" \
+        --arg asked_at "$timestamp" \
+        --arg status "pending" \
+        '{qa_id: $id, from: $from, to: $to, question: $question,
+          asked_at: $asked_at, status: $status, answer: null, answered_at: null}' \
+        > "$qa_file"
+
+    # Notify target via inbox
+    local safe_target
+    safe_target=$(echo "$target" | tr ':.' '_')
+    local inbox_file="$MAILBOX_DIR/${safe_target}.jsonl"
+    mkdir -p "$MAILBOX_DIR"
+
+    printf '%s\n' "$(jq -nc --arg from "$sender" --arg to "$target" \
+        --arg msg "[QA] $question (reply with: swarm reply $qa_id \"answer\")" \
+        --arg ts "$timestamp" --arg qa_id "$qa_id" --arg type "qa" \
+        '{from: $from, to: $to, message: $msg, timestamp: $ts, type: $type, qa_id: $qa_id}')" \
+        >> "$inbox_file"
+
+    echo "QA sent to $target: $qa_id"
+    echo "Question: $question"
+    echo "Target replies with: swarm reply $qa_id \"answer\""
+}
+
+cmd_reply() {
+    local qa_id="$1"
+    shift
+    local answer="$*"
+
+    if [ -z "$qa_id" ] || [ -z "$answer" ]; then
+        echo "Usage: swarm reply <qa_id> \"answer\"" >&2
+        exit 1
+    fi
+
+    local qa_file="$QA_DIR/${qa_id}.json"
+    if [ ! -f "$qa_file" ]; then
+        echo "Error: QA $qa_id not found" >&2
+        exit 1
+    fi
+
+    # Check not already answered
+    local current_status
+    current_status=$(jq -r '.status' "$qa_file")
+    if [ "$current_status" = "answered" ]; then
+        echo "Warning: QA $qa_id already answered" >&2
+    fi
+
+    # Get sender identity
+    local sender="unknown"
+    if [ -n "${TMUX:-}" ]; then
+        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "unknown")
+    fi
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Update QA record
+    jq --arg answer "$answer" --arg ts "$timestamp" --arg by "$sender" \
+        '.answer = $answer | .answered_at = $ts | .answered_by = $by | .status = "answered"' \
+        "$qa_file" > "$qa_file.tmp" && mv "$qa_file.tmp" "$qa_file"
+
+    # Notify the asker via inbox
+    local asker
+    asker=$(jq -r '.from' "$qa_file")
+    local question
+    question=$(jq -r '.question' "$qa_file")
+
+    local safe_asker
+    safe_asker=$(echo "$asker" | tr ':.' '_')
+    local inbox_file="$MAILBOX_DIR/${safe_asker}.jsonl"
+    mkdir -p "$MAILBOX_DIR"
+
+    printf '%s\n' "$(jq -nc --arg from "$sender" --arg to "$asker" \
+        --arg msg "[QA-REPLY] Re: $question -> $answer" \
+        --arg ts "$timestamp" --arg qa_id "$qa_id" --arg type "qa_reply" \
+        '{from: $from, to: $to, message: $msg, timestamp: $ts, type: $type, qa_id: $qa_id}')" \
+        >> "$inbox_file"
+
+    echo "Reply sent for $qa_id -> $asker"
+}
+
+cmd_qa_list() {
+    mkdir -p "$QA_DIR"
+
+    local state_filter=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --state) state_filter="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local count=0
+    for qa_file in "$QA_DIR"/qa_*.json; do
+        [ -f "$qa_file" ] || continue
+
+        local qa_id status from to question
+        qa_id=$(jq -r '.qa_id' "$qa_file")
+        status=$(jq -r '.status' "$qa_file")
+        from=$(jq -r '.from' "$qa_file")
+        to=$(jq -r '.to' "$qa_file")
+        question=$(jq -r '.question' "$qa_file")
+
+        if [ -n "$state_filter" ] && [ "$status" != "$state_filter" ]; then
+            continue
+        fi
+
+        printf "%-30s %-10s %s -> %s\n  Q: %s\n" "$qa_id" "[$status]" "$from" "$to" "$question"
+
+        if [ "$status" = "answered" ]; then
+            local answer
+            answer=$(jq -r '.answer' "$qa_file")
+            printf "  A: %s\n" "$answer"
+        fi
+        echo ""
+        count=$((count + 1))
+    done
+
+    if [ "$count" -eq 0 ]; then
+        echo "No QA records found${state_filter:+ (state=$state_filter)}"
     fi
 }
 
@@ -1896,6 +2077,26 @@ case "${1:-}" in
         shift
         cmd_inbox "$@"
         ;;
+    ask)
+        shift
+        if [ $# -lt 2 ]; then
+            echo "Usage: swarm ask <target> \"question\"" >&2
+            exit 1
+        fi
+        cmd_ask "$@"
+        ;;
+    reply)
+        shift
+        if [ $# -lt 2 ]; then
+            echo "Usage: swarm reply <qa_id> \"answer\"" >&2
+            exit 1
+        fi
+        cmd_reply "$@"
+        ;;
+    qa)
+        shift
+        cmd_qa_list "$@"
+        ;;
     launch|l)
         shift
         if [ $# -lt 1 ]; then
@@ -1953,6 +2154,9 @@ Commands:
   status                            Dashboard of all agents
   send <target> <message>           Send async message to agent's inbox
   inbox [--peek] [--target <pane>]  Read (and clear) inbox messages
+  ask <target> "question"           Send QA question (creates tracked QA record)
+  reply <qa_id> "answer"            Reply to a QA question
+  qa [--state pending|answered]     List QA records
   team create <name> --lead <pane>  Create a team
   team add <name> <pane>            Add member to team
   team remove <name> <pane>         Remove member from team
@@ -1993,6 +2197,9 @@ Examples:
   swarm collect cw:3.0
   swarm send cw:3.0 "Results ready at /tmp/output.json"
   swarm inbox
+  swarm ask mbp:planner.0 "Should the threat model assume black-box?"
+  swarm reply qa_20260329_abc123 "Yes, black-box only. See BlueSuffix Section 3."
+  swarm qa --state pending            # List unanswered questions
   swarm status
   swarm monitor-start mbp                # Launch monitor in session mbp
   swarm monitor-status                   # Check monitor's latest report

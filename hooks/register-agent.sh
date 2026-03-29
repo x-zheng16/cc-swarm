@@ -98,3 +98,13 @@ if [ -f "$CARD_FILE" ]; then
 else
     echo "$NEW_FIELDS" > "$CARD_FILE"
 fi
+
+# Sync pane title -> window name (so tmux tab bar shows session name)
+PANE_TITLE=$($TMUX_BIN display-message -p '#{pane_title}' 2>/dev/null || echo "")
+if [ -n "$PANE_TITLE" ]; then
+    # Strip leading status icons (⠐ ✳ and braille spinners)
+    CLEAN_NAME=$(echo "$PANE_TITLE" | sed 's/^[^a-zA-Z0-9]*//')
+    if [ -n "$CLEAN_NAME" ]; then
+        $TMUX_BIN rename-window -t "$PANE_TARGET" "$CLEAN_NAME" 2>/dev/null || true
+    fi
+fi
