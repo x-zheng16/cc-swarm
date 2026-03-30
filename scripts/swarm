@@ -186,9 +186,40 @@ wait_cc_ready() {
     return 1
 }
 
+# Refresh stale agent cards against tmux reality.
+# One tmux call, then per-card pid comparison. If a pane's window_name changed
+# (e.g. rename), update the card's pane field and rename the file.
+_refresh_stale_cards() {
+    [ -z "${TMUX:-}" ] && return 0
+    local pane_map
+    pane_map=$($TMUX_BIN list-panes -a -F '#{pane_pid}'$'\t''#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null) || return 0
+    [ -z "$pane_map" ] && return 0
+
+    for card in "$AGENTS_DIR"/*.json; do
+        [ -f "$card" ] || continue
+        local card_pid card_pane actual_pane
+        card_pid=$(jq -r '.pid // 0' "$card" 2>/dev/null)
+        [ "$card_pid" = "0" ] && continue
+        card_pane=$(jq -r '.pane // empty' "$card" 2>/dev/null)
+
+        actual_pane=$(printf '%s\n' "$pane_map" | awk -F'\t' -v pid="$card_pid" '$1 == pid {print $2; exit}')
+        [ -z "$actual_pane" ] && continue  # pane gone or not in tmux
+        [ "$actual_pane" = "$card_pane" ] && continue  # no change
+
+        # Target changed — update card and rename file
+        local new_safe new_file
+        new_safe=$(echo "$actual_pane" | tr ':.' '_')
+        new_file="$AGENTS_DIR/${new_safe}.json"
+        jq --arg p "$actual_pane" '.pane = $p' "$card" > "${card}.tmp" && mv "${card}.tmp" "$new_file"
+        [ "$card" != "$new_file" ] && rm -f "$card"
+    done
+}
+
 # --- Commands ---
 
 cmd_list() {
+    _refresh_stale_cards
+
     local verbose=false
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -783,6 +814,85 @@ cmd_register_all() {
     )  # End subshell — set -e automatically restored
 }
 
+# --- Resume-all: batch resume CC sessions from agent cards ---
+
+cmd_resume_all() {
+    local dry_run=false
+    local cc_cmd="cc"
+    local delay=2
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry_run=true; shift ;;
+            --cmd|-c) cc_cmd="$2"; shift 2 ;;
+            --delay) delay="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "${TMUX:-}" ]; then
+        echo "Error: must run inside tmux" >&2
+        exit 1
+    fi
+
+    local total=0 resumed=0 skipped_active=0 skipped_gone=0
+
+    for card in "$AGENTS_DIR"/*.json; do
+        [ -f "$card" ] || continue
+        total=$((total + 1))
+
+        local pane session_id cwd
+        pane=$(jq -r '.pane // empty' "$card" 2>/dev/null)
+        session_id=$(jq -r '.session_id // empty' "$card" 2>/dev/null)
+        cwd=$(jq -r '.cwd // empty' "$card" 2>/dev/null)
+
+        if [ -z "$pane" ] || [ -z "$session_id" ]; then
+            echo "  [SKIP] $(basename "$card" .json) — missing pane or session_id"
+            skipped_gone=$((skipped_gone + 1))
+            continue
+        fi
+
+        # Check if pane exists in tmux
+        if ! $TMUX_BIN display-message -t "$pane" -p '#{pane_pid}' >/dev/null 2>&1; then
+            echo "  [GONE] $pane — pane no longer exists"
+            skipped_gone=$((skipped_gone + 1))
+            continue
+        fi
+
+        # Check if CC is already running in the pane
+        if is_cc_pane "$pane"; then
+            echo "  [ACTIVE] $pane — CC already running"
+            skipped_active=$((skipped_active + 1))
+            continue
+        fi
+
+        if $dry_run; then
+            echo "  [WOULD RESUME] $pane — session ${session_id:0:8}..."
+            resumed=$((resumed + 1))
+            continue
+        fi
+
+        # Resume: cd to cwd first, then launch
+        echo "  [RESUME] $pane — session ${session_id:0:8}..."
+        if [ -n "$cwd" ] && [ -d "$cwd" ]; then
+            $TMUX_BIN send-keys -t "$pane" "cd '$cwd'" Enter
+            sleep 0.3
+        fi
+        $TMUX_BIN send-keys -t "$pane" "$cc_cmd --resume '$session_id'" Enter
+        resumed=$((resumed + 1))
+
+        # Brief delay between launches to avoid overwhelming the system
+        sleep "$delay"
+    done
+
+    echo ""
+    if $dry_run; then
+        echo "Dry run: would resume $resumed/$total agents. $skipped_active already active, $skipped_gone panes gone."
+    else
+        echo "Resumed $resumed/$total agents. $skipped_active already active, $skipped_gone panes gone."
+    fi
+}
+
 cmd_launch() {
     local session=""
     local cc_cmd="cc"
@@ -1348,6 +1458,7 @@ cmd_task_list() {
 # --- Agent card ---
 
 cmd_card() {
+    _refresh_stale_cards
     local subcmd="${1:-}"
 
     case "$subcmd" in
@@ -1854,6 +1965,7 @@ REVIEW_PROMPT
 # --- Heartbeat ---
 
 cmd_heartbeat() {
+    _refresh_stale_cards
     local timeout=60  # default: 60 seconds
 
     while [ $# -gt 0 ]; do
@@ -2685,6 +2797,10 @@ case "${1:-}" in
     register-all|ra)
         cmd_register_all
         ;;
+    resume-all)
+        shift
+        cmd_resume_all "$@"
+        ;;
     monitor-start)
         shift
         cmd_monitor_start "$@"
@@ -2752,6 +2868,7 @@ Commands:
   merge --base B [--sources S1,S2]  Merge worktree branches (conflict-safe)
   rename <name> [--target <pane>]   Atomic rename (CC + pane title + window name + card)
   register-all                      Force-register all CC sessions
+  resume-all [--dry-run] [--cmd cc] Batch resume CC sessions from agent cards
   run <dag.json> [options]          Execute a DAG workflow
 
 Launch options:
