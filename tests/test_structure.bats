@@ -15,6 +15,10 @@ setup() {
     [ -f "$REPO_ROOT/scripts/swarm_dag.py" ]
 }
 
+@test "structure: scripts/swarm_lock.sh exists" {
+    [ -f "$REPO_ROOT/scripts/swarm_lock.sh" ]
+}
+
 @test "structure: hooks/hooks.json exists" {
     [ -f "$REPO_ROOT/hooks/hooks.json" ]
 }

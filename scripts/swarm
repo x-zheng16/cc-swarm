@@ -23,6 +23,7 @@ MAILBOX_DIR="$SWARM_DIR/mailbox"
 TASKS_DIR="$SWARM_DIR/tasks"
 QA_DIR="$SWARM_DIR/qa"
 TOPOLOGY_FILE="$SWARM_DIR/topology.json"
+ACTIVITY_LOG="$SWARM_DIR/activity.jsonl"
 if command -v brew >/dev/null 2>&1; then
     TMUX_BIN="$(brew --prefix)/bin/tmux"
 else
@@ -30,6 +31,33 @@ else
 fi
 
 mkdir -p "$AGENTS_DIR" "$DISPATCH_DIR" "$MAILBOX_DIR" "$TASKS_DIR"
+
+# Source lock library
+SCRIPT_SRC="$0"
+while [ -L "$SCRIPT_SRC" ]; do SCRIPT_SRC="$(readlink "$SCRIPT_SRC")"; done
+SCRIPT_BASE="$(cd "$(dirname "$SCRIPT_SRC")" && pwd -P)"
+if [ -f "$SCRIPT_BASE/swarm_lock.sh" ]; then
+    # shellcheck source=scripts/swarm_lock.sh
+    source "$SCRIPT_BASE/swarm_lock.sh"
+fi
+
+# Log an activity event to the unified JSONL log
+# Usage: log_activity <action> [key=value ...]
+log_activity() {
+    local action="$1"
+    shift
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local json
+    json=$(jq -c -n --arg action "$action" --arg ts "$ts" '{action: $action, timestamp: $ts}')
+    while [ $# -gt 0 ]; do
+        local key="${1%%=*}"
+        local val="${1#*=}"
+        json=$(echo "$json" | jq -c --arg k "$key" --arg v "$val" '. + {($k): $v}')
+        shift
+    done
+    echo "$json" >> "$ACTIVITY_LOG"
+}
 
 # --- Utility functions ---
 
@@ -68,58 +96,48 @@ has_active_tools() {
 }
 
 # Get idle/busy status of a CC pane
-# Priority: hook-reported (if fresh) > process tree > pane content heuristic
+# Priority: process tree (definitive) > hook-reported (event-driven) > exited
+# No TUI heuristics — hooks + process tree are sufficient.
 get_status() {
     local target="$1"
     local safe_name
     safe_name=$(echo "$target" | tr ':.' '_')
 
-    # 1. Check hook-reported status first (if updated within last 120s)
-    if [ -f "$AGENTS_DIR/${safe_name}.json" ]; then
-        local hook_status hook_time
-        hook_status=$(jq -r '.status // empty' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
-        hook_time=$(jq -r '.registered_at // empty' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
-        if [ -n "$hook_status" ] && [ -n "$hook_time" ]; then
-            local hook_epoch now_epoch
-            if date -jf "%Y-%m-%dT%H:%M:%SZ" "$hook_time" "+%s" >/dev/null 2>&1; then
-                hook_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$hook_time" "+%s")
-            elif date -d "$hook_time" "+%s" >/dev/null 2>&1; then
-                hook_epoch=$(date -d "$hook_time" "+%s")
-            else
-                hook_epoch=0
-            fi
-            now_epoch=$(date "+%s")
-            local age=$(( now_epoch - hook_epoch ))
-            if [ "$age" -lt 120 ]; then
-                echo "$hook_status"
-                return
-            fi
-        fi
+    # 1. Is CC process alive in this pane?
+    local pane_pid cc_pid
+    pane_pid=$($TMUX_BIN display-message -t "$target" -p '#{pane_pid}' 2>/dev/null || echo "")
+    if [ -z "$pane_pid" ]; then
+        echo "exited"
+        return
+    fi
+    cc_pid=$(ps -ax -o pid=,ppid=,comm= 2>/dev/null | awk -v pp="$pane_pid" '$2==pp && ($3~/^claude$/ || $3~/^node$/) {print $1}' | head -1)
+    if [ -z "$cc_pid" ]; then
+        echo "exited"
+        return
     fi
 
-    # 2. Process tree check: active tool children = busy
+    # 2. Process tree: active tool children = definitely busy
     if has_active_tools "$target"; then
         echo "busy"
         return
     fi
 
-    # 3. Fallback: pane content heuristic
-    local last_lines
-    last_lines=$($TMUX_BIN capture-pane -t "$target" -p 2>/dev/null | strings | tail -15)
-
-    if echo "$last_lines" | grep -qE '^\s*>|bypass permissions|permissions on|has exited'; then
-        echo "idle"
-    elif echo "$last_lines" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\s+(Opus|Sonnet|Haiku)'; then
-        echo "idle"
-    elif echo "$last_lines" | grep -qE '(Bash|Read|Edit|Write|Grep|Glob|Agent):[0-9]+'; then
-        echo "idle"
-    elif echo "$last_lines" | grep -q '─────'; then
-        echo "idle"
-    elif echo "$last_lines" | grep -qE 'Thinking|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|Processing|Running'; then
-        echo "busy"
-    else
-        echo "unknown"
+    # 3. Hook-reported status — trust if card belongs to current pane process
+    #    Hooks fire on SessionStart (idle), UserPromptSubmit (busy), Stop (idle).
+    #    Card is stale if its pid differs from current pane_pid (new session in same pane).
+    if [ -f "$AGENTS_DIR/${safe_name}.json" ]; then
+        local hook_status card_pid
+        hook_status=$(jq -r '.status // empty' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
+        card_pid=$(jq -r '.pid // 0' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
+        if [ -n "$hook_status" ] && [ "$card_pid" = "$pane_pid" ]; then
+            echo "$hook_status"
+            return
+        fi
+        # Card is from a different pane process — stale, ignore it
     fi
+
+    # 4. CC alive, no tool children, no valid hook → idle (waiting for input)
+    echo "idle"
 }
 
 # Get session ID for a pane from agent registry or filesystem
@@ -183,8 +201,8 @@ get_cwd() {
     $TMUX_BIN display-message -t "$target" -p '#{pane_current_path}' 2>/dev/null || echo ""
 }
 
-# Wait for CC to be fully ready in a pane (TUI visible, idle at prompt)
-# Detection: pane_current_command becomes a version number + status=idle
+# Wait for CC to be fully ready in a pane
+# Detection: CC process alive + hook reports idle (or no tools running)
 wait_cc_ready() {
     local target="$1"
     local timeout="${2:-180}"
@@ -361,6 +379,7 @@ cmd_dispatch() {
         '{target: $target, timestamp: $timestamp, content: $content, status_at_dispatch: $status}' \
         > "$log_file"
 
+    log_activity "dispatch" "target=$target" "mode=v1"
     echo "Dispatched to $target (was: $status)"
     echo "Log: $log_file"
 }
@@ -821,6 +840,17 @@ cmd_send() {
     printf '%s\n' "$(jq -nc --arg from "$sender" --arg to "$target" --arg msg "$message" --arg ts "$timestamp" \
         '{from: $from, to: $to, message: $msg, timestamp: $ts}')" >> "$inbox_file"
 
+    # Push notification via tmux (queued if target is busy)
+    if $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
+        local notify_msg="[swarm:$sender] $message"
+        local buf_name="swarm_notify_$$_$(date +%s%N)"
+        echo "$notify_msg" | $TMUX_BIN load-buffer -b "$buf_name" - 2>/dev/null
+        $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d 2>/dev/null
+        sleep 0.3
+        $TMUX_BIN send-keys -t "$target" Enter 2>/dev/null
+    fi
+
+    log_activity "send" "target=$target" "from=$sender"
     echo "Message sent to $target (from $sender)"
 }
 
@@ -934,6 +964,7 @@ cmd_ask() {
         '{from: $from, to: $to, message: $msg, timestamp: $ts, type: $type, qa_id: $qa_id}')" \
         >> "$inbox_file"
 
+    log_activity "ask" "target=$target" "qa_id=$qa_id"
     echo "QA sent to $target: $qa_id"
     echo "Question: $question"
     echo "Target replies with: swarm reply $qa_id \"answer\""
@@ -993,6 +1024,7 @@ cmd_reply() {
         '{from: $from, to: $to, message: $msg, timestamp: $ts, type: $type, qa_id: $qa_id}')" \
         >> "$inbox_file"
 
+    log_activity "reply" "qa_id=$qa_id" "to=$asker"
     echo "Reply sent for $qa_id -> $asker"
 }
 
@@ -1150,6 +1182,7 @@ cmd_task_create() {
         echo "$prompt_text" > "$task_dir/prompt.md"
     fi
 
+    log_activity "task_create" "task_id=$task_id" "from=$from" "to=$to"
     echo "Task created: $task_id"
     echo "  Dir: $task_dir"
 }
@@ -1383,11 +1416,18 @@ cmd_dispatch_v2() {
 
     local target="$env_to"
 
+    # 4b. Dedup check: reject if already dispatched (unless --force)
+    local current_state
+    current_state=$(jq -r '.state' "$task_dir/status.json")
+    if [ "$current_state" = "dispatched" ] && ! $force; then
+        echo "Error: task '$task_id' already dispatched. Use --force to re-dispatch." >&2
+        exit 1
+    fi
+
     # 5. Update status.json: state -> dispatched, add dispatched_at and transition
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local prev_state
-    prev_state=$(jq -r '.state' "$task_dir/status.json")
+    local prev_state="$current_state"
 
     jq --arg ts "$timestamp" --arg prev "$prev_state" '
         .state = "dispatched" |
@@ -1405,8 +1445,9 @@ cmd_dispatch_v2() {
             && mv "$card_file.tmp" "$card_file"
     fi
 
-    # 7. Append completion notification instruction to prompt.md
-    cat >> "$task_dir/prompt.md" <<NOTIFY
+    # 7. Append completion notification instruction to prompt.md (skip if already present)
+    if ! grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
+        cat >> "$task_dir/prompt.md" <<NOTIFY
 
 ---
 **When you finish this task**, notify the dispatcher:
@@ -1414,9 +1455,11 @@ cmd_dispatch_v2() {
 swarm send $env_from "done: $task_id"
 \`\`\`
 NOTIFY
+    fi
 
     # 8. Dispatch via tmux (skip if no tmux — e.g. test environment)
     if [ -z "${TMUX:-}" ] && ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
+        log_activity "dispatch" "task_id=$task_id" "target=$target" "mode=v2"
         echo "V2 dispatch prepared: task=$task_id target=$target (tmux unavailable, skipping paste)"
         return 0
     fi
@@ -1895,6 +1938,314 @@ REVIEW_PROMPT
     echo "  Result: $review_result_path"
 }
 
+# --- Heartbeat ---
+
+cmd_heartbeat() {
+    local timeout=60  # default: 60 seconds
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout) timeout="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local cards=("$AGENTS_DIR"/*.json)
+    if [ ! -f "${cards[0]:-}" ]; then
+        echo "No agents registered"
+        return 0
+    fi
+
+    local now
+    now=$(date +%s)
+
+    printf "%-25s %-8s %-10s %s\n" "AGENT" "STATUS" "LIVENESS" "LAST HEARTBEAT"
+    printf "%-25s %-8s %-10s %s\n" "-----" "------" "--------" "--------------"
+
+    for card in "${cards[@]}"; do
+        local pane status hb liveness age_str
+        pane=$(jq -r '.pane // "?"' "$card")
+        status=$(jq -r '.status // "?"' "$card")
+        hb=$(jq -r '.last_heartbeat // empty' "$card")
+
+        if [ -z "$hb" ]; then
+            liveness="no heartbeat"
+            age_str="-"
+        else
+            # Parse ISO timestamp to epoch
+            local hb_epoch
+            hb_epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%SZ" "$hb" +%s 2>/dev/null || \
+                       date -u -d "$hb" +%s 2>/dev/null || echo 0)
+            local age=$((now - hb_epoch))
+
+            if [ "$age" -le "$timeout" ]; then
+                liveness="alive"
+            else
+                liveness="stale"
+            fi
+
+            if [ "$age" -lt 60 ]; then
+                age_str="${age}s ago"
+            elif [ "$age" -lt 3600 ]; then
+                age_str="$((age / 60))m ago"
+            else
+                age_str="$((age / 3600))h ago"
+            fi
+        fi
+
+        printf "%-25s %-8s %-10s %s\n" "$pane" "$status" "$liveness" "$age_str"
+    done
+}
+
+# --- Drain signal ---
+
+cmd_drain() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        echo "Usage: swarm drain <target>" >&2
+        exit 1
+    fi
+
+    mkdir -p "$SWARM_DIR/drain"
+    local safe_target
+    safe_target=$(echo "$target" | tr ':.' '_')
+
+    # Write drain signal file
+    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$SWARM_DIR/drain/$safe_target"
+
+    # Update agent card if it exists
+    local card="$AGENTS_DIR/${safe_target}.json"
+    if [ -f "$card" ]; then
+        jq '. + {draining: true}' "$card" > "$card.tmp" && mv "$card.tmp" "$card"
+    fi
+
+    log_activity "drain" "target=$target"
+    echo "Drain signal sent to $target (will stop after current task)"
+}
+
+cmd_cancel_drain() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        echo "Usage: swarm cancel-drain <target>" >&2
+        exit 1
+    fi
+
+    local safe_target
+    safe_target=$(echo "$target" | tr ':.' '_')
+
+    rm -f "$SWARM_DIR/drain/$safe_target"
+
+    # Update agent card if it exists
+    local card="$AGENTS_DIR/${safe_target}.json"
+    if [ -f "$card" ]; then
+        jq '. + {draining: false}' "$card" > "$card.tmp" && mv "$card.tmp" "$card"
+    fi
+
+    echo "Drain cancelled for $target"
+}
+
+cmd_check_drain() {
+    local target=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --target) target="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$target" ]; then
+        echo "Usage: swarm check-drain --target <pane>" >&2
+        exit 1
+    fi
+
+    local safe_target
+    safe_target=$(echo "$target" | tr ':.' '_')
+
+    if [ -f "$SWARM_DIR/drain/$safe_target" ]; then
+        echo "Status: draining"
+    else
+        echo "Status: active"
+    fi
+}
+
+# --- Activity log ---
+
+cmd_log() {
+    local last=50
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --last) last="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ ! -f "$ACTIVITY_LOG" ] || [ ! -s "$ACTIVITY_LOG" ]; then
+        echo "No activity logged yet"
+        return 0
+    fi
+
+    tail -n "$last" "$ACTIVITY_LOG" | jq -r \
+        '"\(.timestamp)  \(.action)\t\(to_entries | map(select(.key != "action" and .key != "timestamp")) | map("\(.key)=\(.value)") | join(" "))"'
+}
+
+# --- Merge coordinator ---
+
+cmd_merge() {
+    local base="" sources="" dry_run=false force=false repo="."
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --base)     base="$2"; shift 2 ;;
+            --sources)  sources="$2"; shift 2 ;;
+            --dry-run)  dry_run=true; shift ;;
+            --force)    force=true; shift ;;
+            --repo)     repo="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    # Validate base branch exists
+    if [ -z "$base" ]; then
+        echo "Error: --base is required" >&2
+        echo "Usage: swarm merge --base <branch> [--sources b1,b2] [--dry-run] [--force]" >&2
+        exit 1
+    fi
+
+    if ! git -C "$repo" rev-parse --verify "$base" >/dev/null 2>&1; then
+        echo "Error: base branch '$base' not found" >&2
+        exit 1
+    fi
+
+    # Enumerate source branches
+    local -a branch_list=()
+    if [ -n "$sources" ]; then
+        IFS=',' read -ra branch_list <<< "$sources"
+    else
+        # Auto-detect: worktree branches except base
+        while IFS= read -r line; do
+            local wt_branch
+            wt_branch=$(echo "$line" | awk '{print $3}' | sed 's/\[//;s/\]//')
+            if [ -n "$wt_branch" ] && [ "$wt_branch" != "$base" ]; then
+                branch_list+=("$wt_branch")
+            fi
+        done < <(git -C "$repo" worktree list 2>/dev/null | tail -n +2)
+    fi
+
+    if [ ${#branch_list[@]} -eq 0 ]; then
+        echo "Error: No source branches found" >&2
+        exit 1
+    fi
+
+    echo "Analyzing ${#branch_list[@]} branch(es) against $base..."
+    echo ""
+
+    local clean_count=0 conflict_count=0
+    local -a clean_branches=()
+    local -a conflict_branches=()
+
+    for branch in "${branch_list[@]}"; do
+        if ! git -C "$repo" rev-parse --verify "$branch" >/dev/null 2>&1; then
+            echo "  [SKIP]     $branch (branch not found)"
+            continue
+        fi
+
+        # Get diff stats
+        local stat_summary
+        stat_summary=$(git -C "$repo" diff --shortstat "$base...$branch" 2>/dev/null | \
+            sed 's/^ *//' | sed 's/ file.*/file/' | sed 's/ insertion.*/+/' | \
+            tr -d '\n')
+        local file_count
+        file_count=$(git -C "$repo" diff --name-only "$base...$branch" 2>/dev/null | wc -l | tr -d ' ')
+
+        # Run merge-tree for conflict detection (|| true prevents set -e abort)
+        local merge_output merge_exit=0
+        merge_output=$(git -C "$repo" merge-tree --write-tree "$base" "$branch" 2>&1) || merge_exit=$?
+
+        if [ $merge_exit -eq 0 ]; then
+            printf "  [CLEAN]    %-20s (%s files changed)\n" "$branch" "$file_count"
+            clean_count=$((clean_count + 1))
+            clean_branches+=("$branch")
+        else
+            conflict_count=$((conflict_count + 1))
+            conflict_branches+=("$branch")
+            # Extract conflicted file names
+            local conflicts
+            conflicts=$(echo "$merge_output" | grep "^CONFLICT" | sed 's/.*Merge conflict in /  - /' | sed 's/CONFLICT (\([^)]*\)): .*/  - \1 conflict/')
+            if [ -z "$conflicts" ]; then
+                conflicts=$(echo "$merge_output" | grep -v "^[0-9a-f]" | head -5)
+            fi
+            local conflict_file_count
+            conflict_file_count=$(echo "$merge_output" | grep -c "CONFLICT" || true)
+            printf "  [CONFLICT] %-20s %s conflicted file(s):\n" "$branch" "$conflict_file_count"
+            echo "$merge_output" | grep "CONFLICT" | while read -r cline; do
+                local cfile
+                cfile=$(echo "$cline" | sed 's/.*Merge conflict in //' | sed 's/CONFLICT.*//')
+                if [ -n "$cfile" ]; then
+                    echo "               - $cfile"
+                else
+                    echo "               $cline"
+                fi
+            done
+        fi
+    done
+
+    echo ""
+    echo "Result: $clean_count clean, $conflict_count conflict(s)"
+
+    if $dry_run; then
+        if [ $conflict_count -gt 0 ] && [ $clean_count -gt 0 ]; then
+            local clean_csv
+            clean_csv=$(IFS=','; echo "${clean_branches[*]}")
+            echo "Run 'swarm merge --base $base --sources $clean_csv' to merge clean branches."
+        fi
+        [ $conflict_count -gt 0 ] && exit 1
+        exit 0
+    fi
+
+    # Abort if conflicts and no --force
+    if [ $conflict_count -gt 0 ] && ! $force; then
+        echo "Aborting: resolve conflicts first or use --force"
+        exit 1
+    fi
+
+    # Sequential merge
+    if [ ${#clean_branches[@]} -eq 0 ]; then
+        echo "No clean branches to merge."
+        exit 0
+    fi
+
+    local original_branch
+    original_branch=$(git -C "$repo" branch --show-current)
+
+    if ! git -C "$repo" diff-index --quiet HEAD -- 2>/dev/null; then
+        echo "Error: working tree is dirty. Commit or stash changes first." >&2
+        exit 1
+    fi
+
+    git -C "$repo" checkout "$base" 2>/dev/null
+
+    for branch in "${clean_branches[@]}"; do
+        echo "Merging $branch into $base..."
+        if ! git -C "$repo" merge --no-ff "$branch" -m "merge: $branch into $base" 2>&1; then
+            echo "Error: merge of $branch failed. Aborting." >&2
+            git -C "$repo" merge --abort 2>/dev/null || true
+            git -C "$repo" checkout "$original_branch" 2>/dev/null || true
+            exit 1
+        fi
+        echo "  Merged $branch"
+    done
+
+    echo ""
+    echo "Merged ${#clean_branches[@]} branch(es) into $base."
+
+    # Return to original branch if different
+    if [ "$original_branch" != "$base" ] && [ -n "$original_branch" ]; then
+        git -C "$repo" checkout "$original_branch" 2>/dev/null || true
+    fi
+}
+
 # --- Monitor agent ---
 
 MONITOR_DIR="$SWARM_DIR/monitor"
@@ -2132,6 +2483,38 @@ case "${1:-}" in
         fi
         cmd_launch "$@"
         ;;
+    merge)
+        shift
+        cmd_merge "$@"
+        ;;
+    heartbeat|hb)
+        shift
+        cmd_heartbeat "$@"
+        ;;
+    drain)
+        shift
+        if [ $# -lt 1 ]; then
+            echo "Usage: swarm drain <target>" >&2
+            exit 1
+        fi
+        cmd_drain "$@"
+        ;;
+    cancel-drain)
+        shift
+        if [ $# -lt 1 ]; then
+            echo "Usage: swarm cancel-drain <target>" >&2
+            exit 1
+        fi
+        cmd_cancel_drain "$@"
+        ;;
+    check-drain)
+        shift
+        cmd_check_drain "$@"
+        ;;
+    log)
+        shift
+        cmd_log "$@"
+        ;;
     register-all|ra)
         cmd_register_all
         ;;
@@ -2193,6 +2576,12 @@ Commands:
   topology                          Pretty-print full topology
   monitor-start [session] [--dry-run]  Launch the monitor watchdog agent
   monitor-status                    Show monitor agent's latest report
+  heartbeat [--timeout N]            Show agent liveness (default: 60s)
+  drain <target>                     Signal agent to stop after current task
+  cancel-drain <target>              Cancel a drain signal
+  check-drain --target <pane>        Check if agent is draining
+  log [--last N]                      Show activity log (default: last 50)
+  merge --base B [--sources S1,S2]  Merge worktree branches (conflict-safe)
   run <dag.json> [options]          Execute a DAG workflow
 
 Launch options:

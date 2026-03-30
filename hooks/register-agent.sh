@@ -85,6 +85,9 @@ elif [ "$STATUS" = "busy" ]; then
     NEW_FIELDS=$(echo "$NEW_FIELDS" | jq '. + {idle_since: null}')
 fi
 
+# Heartbeat: always update timestamp on every hook fire
+NEW_FIELDS=$(echo "$NEW_FIELDS" | jq --arg ts "$TIMESTAMP" '. + {last_heartbeat: $ts}')
+
 # Merge-update: preserve v2 fields (role, team, capabilities, current_task)
 CARD_FILE="$AGENTS_DIR/${SAFE_NAME}.json"
 if [ -f "$CARD_FILE" ]; then

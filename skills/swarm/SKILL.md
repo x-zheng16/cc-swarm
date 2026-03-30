@@ -36,6 +36,12 @@ Teams and roles provide organizational structure, but any agent can talk to any 
 | `swarm ask <target> "question"` | Send tracked QA question |
 | `swarm reply <qa_id> "answer"` | Reply to a QA question |
 | `swarm qa [--state S]` | List QA records |
+| `swarm heartbeat [--timeout N]` | Show agent liveness (default: 60s) |
+| `swarm drain <target>` | Signal agent to stop after current task |
+| `swarm cancel-drain <target>` | Cancel a drain signal |
+| `swarm check-drain --target <pane>` | Check if agent is draining |
+| `swarm log [--last N]` | Show activity log (default: last 50) |
+| `swarm merge --base B [--sources S1,S2]` | Merge worktree branches (conflict-safe) |
 | `swarm run <dag.json>` | Execute a DAG workflow |
 | `swarm monitor-start [--session S]` | Launch the monitor agent |
 | `swarm monitor-status` | Show monitor report |
@@ -214,6 +220,49 @@ swarm inbox            # read and clear
 swarm inbox --peek     # read without clearing
 ```
 
+## Heartbeat and Liveness
+
+Every hook fire (SessionStart, UserPromptSubmit, Stop) writes `last_heartbeat` to the agent card.
+The monitor (or any agent) can check liveness:
+
+```bash
+swarm heartbeat              # show all agents, alive/stale/no-heartbeat
+swarm heartbeat --timeout 30 # stale if no heartbeat in 30s (default: 60s)
+```
+
+## Drain Signal
+
+Gracefully stop an agent after its current task finishes:
+
+```bash
+swarm drain mbp:5.0          # signal: stop after current task
+swarm check-drain --target mbp:5.0  # check: "draining" or "active"
+swarm cancel-drain mbp:5.0   # cancel the drain
+```
+
+When receiving a task, check `swarm check-drain` first.
+If draining, reject new tasks and go idle.
+
+## Dispatch Dedup
+
+V2 dispatch rejects re-dispatching an already-dispatched task.
+Use `--force` to override:
+
+```bash
+swarm dispatch --task 20260330_auth --force
+```
+
+## Activity Log
+
+All key actions (dispatch, send, ask, reply, task create, drain) are logged to `~/.claude-swarm/activity.jsonl`.
+
+```bash
+swarm log              # last 50 events
+swarm log --last 10    # last 10 events
+```
+
+Useful for debugging multi-agent coordination and auditing what happened.
+
 ## Monitor Agent
 
 A dedicated CC session watches all agents and proactively helps.
@@ -251,6 +300,26 @@ swarm run workflow.json --dry-run   # validate
 swarm run workflow.json             # execute
 swarm run workflow.json --resume    # resume after interruption
 ```
+
+## Merge Coordinator
+
+After agents finish work in worktrees, merge branches back safely.
+Uses `git merge-tree --write-tree` for non-destructive conflict detection.
+
+```bash
+# Dry run: check for conflicts without merging
+swarm merge --base main --sources feature-a,feature-b --dry-run
+
+# Merge clean branches sequentially into base
+swarm merge --base main --sources feature-a,feature-b
+
+# Auto-detect worktree branches (all except base)
+swarm merge --base main --dry-run
+```
+
+Output shows `[CLEAN]` / `[CONFLICT]` per branch with file counts.
+If conflicts exist and no `--force`, merge aborts.
+Always dry-run first, then merge only the clean branches.
 
 ## Important Rules
 
