@@ -71,16 +71,18 @@ NEW_FIELDS=$(jq -n \
     --arg session_id "$SESSION_ID" \
     --arg cwd "$CWD" \
     --arg jsonl_path "$JSONL_PATH" \
-    --argjson pid $$ \
+    --argjson pid "$($TMUX_BIN display-message -p '#{pane_pid}' 2>/dev/null || echo 0)" \
     --arg status "$STATUS" \
     --arg event "$EVENT" \
     --arg registered_at "$TIMESTAMP" \
     '{pane: $pane, session_id: $session_id, cwd: $cwd, jsonl_path: $jsonl_path,
       pid: $pid, status: $status, event: $event, registered_at: $registered_at}')
 
-# Track idle_since: set when transitioning to idle
+# Track idle_since: set when transitioning to idle, clear on busy
 if [ "$STATUS" = "idle" ]; then
     NEW_FIELDS=$(echo "$NEW_FIELDS" | jq --arg ts "$TIMESTAMP" '. + {idle_since: $ts}')
+elif [ "$STATUS" = "busy" ]; then
+    NEW_FIELDS=$(echo "$NEW_FIELDS" | jq '. + {idle_since: null}')
 fi
 
 # Merge-update: preserve v2 fields (role, team, capabilities, current_task)

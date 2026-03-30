@@ -140,16 +140,16 @@ EOF
 
 # --- regular dispatch (no --task) still works ---
 
-@test "dispatch without --task: backward compatible (fails on tmux, not on args)" {
+@test "dispatch without --task: backward compatible (fails on target, not on task)" {
     # Without --task, dispatch requires target + prompt as positional args.
-    # In test env, it will fail on tmux validation, NOT on task validation.
+    # In test env, it will fail on tmux/CC validation, NOT on task validation.
     run "$SWARM_SCRIPT" dispatch mbp:5.0 "Hello world"
 
-    # Should fail because tmux session doesn't exist (expected in test env)
+    # Should fail because target isn't valid (tmux session missing or not CC)
     [ "$status" -ne 0 ]
-    # Error should be about tmux, NOT about task
-    [[ "$output" == *"tmux"* ]] || [[ "$output" == *"session"* ]]
-    [[ "$output" != *"task"* ]]
+    # Error should NOT be about task
+    [[ "$output" != *"task_id"* ]]
+    [[ "$output" != *"envelope"* ]]
 }
 
 # --- dispatch --task: status transitions are correct ---

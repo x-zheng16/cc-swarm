@@ -13,13 +13,13 @@ Teams and roles provide organizational structure, but any agent can talk to any 
 
 | Command | What it does |
 | --- | --- |
-| `swarm list` | Show all CC sessions with status |
+| `swarm list [-v]` | Show registered agents (-v adds session_id) |
 | `swarm status` | Dashboard of all agents |
 | `swarm launch <session> [options]` | Launch CC sessions sequentially in tmux |
 | `swarm task create --id X --from P --to P` | Create a structured task |
 | `swarm task status <id>` | Show task state |
 | `swarm task list [--state S]` | List tasks, optionally filtered |
-| `swarm dispatch <target> --task <id>` | V2 dispatch with envelope validation |
+| `swarm dispatch --task <id>` | V2 dispatch (target from envelope) |
 | `swarm dispatch <target> "prompt"` | V1 dispatch (simple, no tracking) |
 | `swarm dispatch <target> --file <path>` | V1 dispatch from file |
 | `swarm review <task_id> --reviewer <pane>` | Request cross-agent review |
@@ -33,16 +33,20 @@ Teams and roles provide organizational structure, but any agent can talk to any 
 | `swarm topology` | Show full topology |
 | `swarm send <target> "msg"` | Async message to inbox |
 | `swarm inbox [--peek]` | Read your inbox |
+| `swarm ask <target> "question"` | Send tracked QA question |
+| `swarm reply <qa_id> "answer"` | Reply to a QA question |
+| `swarm qa [--state S]` | List QA records |
 | `swarm run <dag.json>` | Execute a DAG workflow |
 | `swarm monitor-start [--session S]` | Launch the monitor agent |
 | `swarm monitor-status` | Show monitor report |
+| `swarm register-all` | Bulk-register existing CC sessions |
 
 ## Identity and Teams
 
 Every agent has a card at `~/.claude-swarm/agents/{pane}.json` with:
 - `role`: worker (default), lead, or monitor
-- `team`: team name (e.g., "research-safety")
-- `capabilities`: what you can do (e.g., ["research", "paper-writing"])
+- `team`: team name (e.g., "backend")
+- `capabilities`: what you can do (e.g., ["coding", "testing"])
 - `current_task`: task_id you are working on (set by dispatch, cleared on idle)
 
 Check your own card: `swarm card` (auto-detects your pane).
@@ -76,8 +80,8 @@ swarm task create --id 20260328_analyze_data \
     --from mbp:1.0 --to mbp:5.0 \
     --type task --prompt "Analyze experiment results in /tmp/data.json"
 
-# 2. Dispatch
-swarm dispatch mbp:5.0 --task 20260328_analyze_data
+# 2. Dispatch (target read from envelope's "to" field)
+swarm dispatch --task 20260328_analyze_data
 
 # 3. Wait
 swarm monitor mbp:5.0 --wait 600
@@ -102,9 +106,13 @@ The CLI manages transitions.
 Status is tracked in `~/.claude-swarm/tasks/{task_id}/status.json`.
 Check with: `swarm task status <task_id>`.
 
+V2 dispatch automatically appends a notification instruction to prompt.md.
+The receiving agent will `swarm send <dispatcher> "done: <task_id>"` when finished.
+The dispatcher sees this in their inbox (`swarm inbox`).
+
 ### Task ID Convention
 
-Format: `{YYYYMMDD}_{slug}` (e.g., `20260328_poisoned_skill_draft`).
+Format: `{YYYYMMDD}_{slug}` (e.g., `20260328_auth_refactor`).
 Review rounds: append `_review_r1`, `_r2`, etc.
 
 ## Review Exchange
@@ -172,6 +180,30 @@ Before a large task, establish expectations with your dispatcher:
 Write the agreement into prompt.md so both parties share the same expectations.
 This prevents the common failure: agent does great work, but not what was asked.
 
+## QA Protocol
+
+For bidirectional question-answer exchanges between agents.
+Used when an agent needs clarification from another agent.
+
+```bash
+# Agent asks a question (creates tracked QA record, notifies target via inbox)
+swarm ask mbp:lead.0 "Should we use the streaming API or batch?"
+# -> qa_20260329_100253_bea634
+
+# Target reads inbox, sees [QA] message with reply instructions
+swarm inbox
+
+# Target replies (notifies asker via inbox)
+swarm reply qa_20260329_100253_bea634 "Streaming. See the design doc at /tmp/api_design.md"
+
+# List all QA records
+swarm qa
+swarm qa --state pending    # only unanswered questions
+```
+
+QA records are stored in `~/.claude-swarm/qa/` with full audit trail (who asked, when, who answered, when).
+Team leads should log QA interactions to `qa_log.md` for compaction recovery.
+
 ## Async Mailbox
 
 For non-blocking messages between agents.
@@ -229,6 +261,7 @@ swarm run workflow.json --resume    # resume after interruption
 - **Sequential launches only.** `swarm launch` enforces this. Never launch CC sessions in parallel.
 - **Context resets over compaction.** If your context is getting large, write state to files and ask for a fresh session with a continuation prompt.
 - **Status is heuristic.** If `swarm status` shows "unknown", the agent may be at an unusual state.
+- **`swarm list` shows registered agents only.** Agents auto-register via hooks. For pre-existing sessions without hooks, run `swarm register-all` to bulk-register.
 
 ## Launching Sessions
 

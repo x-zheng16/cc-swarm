@@ -353,14 +353,13 @@ cmd_dispatch() {
         content="$prompt"
     fi
 
-    cat > "$log_file" <<EOF
-{
-  "target": "$target",
-  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "content": $(echo "$content" | jq -Rs .),
-  "status_at_dispatch": "$status"
-}
-EOF
+    jq -n \
+        --arg target "$target" \
+        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --arg content "$content" \
+        --arg status "$status" \
+        '{target: $target, timestamp: $timestamp, content: $content, status_at_dispatch: $status}' \
+        > "$log_file"
 
     echo "Dispatched to $target (was: $status)"
     echo "Log: $log_file"
@@ -378,9 +377,12 @@ cmd_monitor() {
         case "$1" in
             --wait)
                 mode="wait"
-                timeout="${2:-600}"
                 shift
-                [ "${1:-}" ] && [[ "$1" =~ ^[0-9]+$ ]] && { timeout="$1"; shift; }
+                # Next arg is timeout only if numeric
+                if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+                    timeout="$1"
+                    shift
+                fi
                 ;;
             --tail)
                 mode="tail"
@@ -502,7 +504,7 @@ with open(log_file, 'rb') as f:
     for raw_line in f:
         try:
             obj = json.loads(raw_line)
-        except:
+        except (json.JSONDecodeError, ValueError):
             continue
         msg = obj.get('message', {})
         if msg.get('role') != 'assistant':
@@ -536,7 +538,11 @@ cmd_status() {
 
     while IFS=$'\t' read -r sess_name win_idx pane_idx pane_cmd pane_title pane_path; do
         local target="${sess_name}:${win_idx}.${pane_idx}"
-        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$pane_cmd" == "node" && "$pane_title" == *"✳"* ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
+
+        # Use same detection as cmd_list: agent card must exist
+        local safe_name
+        safe_name=$(echo "$target" | tr ':.' '_')
+        if [ ! -f "$SWARM_DIR/agents/${safe_name}.json" ]; then
             continue
         fi
 
@@ -652,17 +658,17 @@ cmd_register_all() {
             timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             local cur_status
             cur_status=$(get_status "$target")
-            cat > "$AGENTS_DIR/${safe_name}.json" <<EOF
-{
-  "pane": "$target",
-  "session_id": "$session_id",
-  "cwd": "$pane_path",
-  "pid": ${cc_pid:-0},
-  "status": "$cur_status",
-  "event": "register-all",
-  "registered_at": "$timestamp"
-}
-EOF
+            jq -n \
+                --arg pane "$target" \
+                --arg session_id "$session_id" \
+                --arg cwd "$pane_path" \
+                --argjson pid "${cc_pid:-0}" \
+                --arg status "$cur_status" \
+                --arg event "register-all" \
+                --arg registered_at "$timestamp" \
+                '{pane: $pane, session_id: $session_id, cwd: $cwd, pid: $pid,
+                  status: $status, event: $event, registered_at: $registered_at}' \
+                > "$AGENTS_DIR/${safe_name}.json"
             echo "  $target — registered (session: ${session_id:0:8}...)"
             count=$((count + 1))
         else
@@ -769,6 +775,13 @@ cmd_launch() {
             echo ""
             echo "  CC ready in $target"
             launched=$((launched + 1))
+
+            # Ensure CC session name is set via /rename (cc -n may not pass through)
+            if [ -n "$instance_name" ]; then
+                sleep 1
+                $TMUX_BIN send-keys -t "$target" "/rename $instance_name" Enter
+                sleep 0.5
+            fi
         else
             echo ""
             echo "  WARNING: CC did not become ready in $target within ${timeout}s" >&2
@@ -893,7 +906,7 @@ cmd_ask() {
     local short_ts
     short_ts=$(date -u +"%Y%m%d_%H%M%S")
     local hash
-    hash=$(echo "${sender}_${target}_${short_ts}" | shasum | cut -c1-6)
+    hash=$(echo "${sender}_${target}_${short_ts}_${question}" | shasum | cut -c1-6)
     local qa_id="qa_${short_ts}_${hash}"
 
     # Create QA record
@@ -1064,6 +1077,10 @@ cmd_task_create() {
     # Validate required fields
     if [ -z "$task_id" ]; then
         echo "Error: --id is required" >&2
+        exit 1
+    fi
+    if [[ "$task_id" =~ [/\\] ]]; then
+        echo "Error: task_id must not contain path separators" >&2
         exit 1
     fi
     if [ -z "$from" ]; then
@@ -1315,8 +1332,8 @@ cmd_dispatch_v2() {
                 shift
                 ;;
             *)
-                echo "Error: unknown option for v2 dispatch: $1" >&2
-                exit 1
+                # Ignore positional args (target comes from envelope, not CLI)
+                shift
                 ;;
         esac
     done
@@ -1388,7 +1405,17 @@ cmd_dispatch_v2() {
             && mv "$card_file.tmp" "$card_file"
     fi
 
-    # 7. Dispatch via tmux (skip if no tmux — e.g. test environment)
+    # 7. Append completion notification instruction to prompt.md
+    cat >> "$task_dir/prompt.md" <<NOTIFY
+
+---
+**When you finish this task**, notify the dispatcher:
+\`\`\`bash
+swarm send $env_from "done: $task_id"
+\`\`\`
+NOTIFY
+
+    # 8. Dispatch via tmux (skip if no tmux — e.g. test environment)
     if [ -z "${TMUX:-}" ] && ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
         echo "V2 dispatch prepared: task=$task_id target=$target (tmux unavailable, skipping paste)"
         return 0
@@ -1432,16 +1459,16 @@ cmd_dispatch_v2() {
     local safe_log
     safe_log=$(echo "$target" | tr ':.' '_')
     local log_file="$DISPATCH_DIR/$(date +%Y%m%d_%H%M%S)_${safe_log}.json"
-    cat > "$log_file" <<EOF
-{
-  "target": "$target",
-  "task_id": "$task_id",
-  "timestamp": "$timestamp",
-  "content": "(task: $task_id)",
-  "status_at_dispatch": "$status",
-  "version": 2
-}
-EOF
+    jq -n \
+        --arg target "$target" \
+        --arg task_id "$task_id" \
+        --arg timestamp "$timestamp" \
+        --arg content "(task: $task_id)" \
+        --arg status "$status" \
+        --argjson version 2 \
+        '{target: $target, task_id: $task_id, timestamp: $timestamp,
+          content: $content, status_at_dispatch: $status, version: $version}' \
+        > "$log_file"
 
     echo "V2 dispatched: task=$task_id -> $target (was: $status)"
     echo "Log: $log_file"
@@ -2035,8 +2062,8 @@ case "${1:-}" in
         ;;
     dispatch|d)
         shift
-        # V2 dispatch: --task flag takes a task_id (target comes from envelope)
-        if [ "${1:-}" = "--task" ]; then
+        # V2 dispatch: --task flag anywhere in args (target comes from envelope)
+        if [[ " $* " == *" --task "* ]]; then
             cmd_dispatch_v2 "$@"
         else
             if [ $# -lt 2 ]; then
@@ -2138,7 +2165,7 @@ Commands:
   launch <session> [options]        Launch CC sessions sequentially in tmux
   dispatch <target> <prompt>        Send prompt to a CC session
   dispatch <target> --file <path>   Send file reference (agent reads the file)
-  dispatch <target> --task <id>    V2 dispatch with envelope validation
+  dispatch --task <id>              V2 dispatch (target from envelope.json)
   task create --id X --from --to   Create a structured task with envelope
   task status <id>                 Show task state
   task list [--state S]            List tasks, optionally filtered by state
