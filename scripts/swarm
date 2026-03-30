@@ -448,8 +448,9 @@ cmd_dispatch() {
         cat >> "$task_dir/prompt.md" <<NOTIFY
 
 ---
-**When you finish this task**, notify the dispatcher:
+**When you finish this task**, update status and notify the dispatcher:
 \`\`\`bash
+swarm task update $task_id --state completed
 swarm send $notify_target "done: $task_id"
 \`\`\`
 NOTIFY
@@ -1298,9 +1299,10 @@ cmd_task() {
     case "$subcmd" in
         create) cmd_task_create "$@" ;;
         status) cmd_task_status "$@" ;;
+        update) cmd_task_update "$@" ;;
         list)   cmd_task_list "$@" ;;
         *)
-            echo "Usage: swarm task <create|status|list> [args]" >&2
+            echo "Usage: swarm task <create|status|update|list> [args]" >&2
             exit 1
             ;;
     esac
@@ -1441,6 +1443,70 @@ cmd_task_status() {
     else
         printf "Result: %s (pending)\n" "$result_path"
     fi
+}
+
+cmd_task_update() {
+    local task_id="" new_state=""
+
+    # First positional arg is task_id (unless it starts with --)
+    if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+        task_id="$1"; shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --state)
+                if [ $# -lt 2 ]; then
+                    echo "Error: --state requires a value" >&2; exit 1
+                fi
+                new_state="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [ -z "$task_id" ]; then
+        echo "Usage: swarm task update <task_id> --state <new_state>" >&2
+        exit 1
+    fi
+    if [ -z "$new_state" ]; then
+        echo "Error: --state is required" >&2
+        exit 1
+    fi
+    if [[ "$task_id" =~ [/\\] ]]; then
+        echo "Error: task_id must not contain path separators" >&2
+        exit 1
+    fi
+
+    local task_dir="$TASKS_DIR/$task_id"
+    if [ ! -d "$task_dir" ]; then
+        echo "Error: task '$task_id' not found" >&2
+        exit 1
+    fi
+
+    local status_file="$task_dir/status.json"
+    if [ ! -f "$status_file" ]; then
+        echo "Error: status.json missing for task '$task_id'" >&2
+        exit 1
+    fi
+
+    mkdir -p "$SWARM_DIR/locks"
+    local lock_dir="$SWARM_DIR/locks/task_update_${task_id}"
+    local old_state timestamp
+
+    _do_task_update() {
+        old_state=$(jq -r '.state' "$status_file")
+        timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        jq \
+            --arg new_state "$new_state" \
+            --arg old_state "$old_state" \
+            --arg at "$timestamp" \
+            '.state = $new_state | .transitions += [{from: $old_state, to: $new_state, at: $at}]' \
+            "$status_file" > "$status_file.tmp" && mv "$status_file.tmp" "$status_file"
+    }
+    with_lock "$lock_dir" _do_task_update
+
+    log_activity "task_update" "task_id=$task_id" "state=$old_state->$new_state"
+    echo "Task $task_id: $old_state -> $new_state"
 }
 
 cmd_task_list() {
@@ -2880,6 +2946,7 @@ Commands:
   dispatch --task <id>              Dispatch pre-created task (target from envelope)
   task create --id X --from --to   Create a structured task with envelope
   task status <id>                 Show task state
+  task update <id> --state <S>     Update task state (appends transition)
   task list [--state S]            List tasks, optionally filtered by state
   review <task_id> --reviewer <p>  Request cross-agent review
   card [<target>]                  Show agent card (auto-detect if no target)

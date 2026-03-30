@@ -18,6 +18,7 @@ Teams and roles provide organizational structure, but any agent can talk to any 
 | `swarm launch <session> [options]` | Launch CC sessions sequentially in tmux |
 | `swarm task create --id X --from P --to P` | Create a structured task |
 | `swarm task status <id>` | Show task state |
+| `swarm task update <id> --state <S>` | Update task state (appends transition) |
 | `swarm task list [--state S]` | List tasks, optionally filtered |
 | `swarm dispatch --task <id>` | V2 dispatch (target from envelope) |
 | `swarm dispatch <target> "prompt"` | V1 dispatch (simple, no tracking) |
@@ -71,10 +72,13 @@ When you receive a task via `swarm dispatch --task`:
 1. You see: `Read and execute the task in ~/.claude-swarm/tasks/{task_id}/prompt.md`
 2. Read `prompt.md` for instructions.
 3. Read `envelope.json` from the same directory for metadata (who sent it, what type, where to write results).
-4. **Verify relevance**: does this task match your session's purpose? If not, reject it and notify the sender.
-5. Execute the task.
-6. Write your output to the `result_path` specified in envelope.json.
-7. Go idle. The system detects completion automatically.
+4. **Verify relevance**: does this task match your session's purpose? If not, reject via `swarm send <from> "misdirected: <reason>"`.
+5. Check drain status: `swarm check-drain --target <your_pane>`. If draining, notify sender and skip.
+6. Execute the task.
+7. Write your output to the `result_path` specified in envelope.json.
+8. Mark complete: `swarm task update <task_id> --state completed`
+9. Notify sender: `swarm send <from> "done: <task_id>"`
+10. Go idle.
 
 ## Sending Tasks (V2 Protocol)
 
@@ -185,6 +189,8 @@ Rules for the reviewer:
 2. Distinguish severity clearly (Critical vs Important vs Minor).
 3. ACCEPT only when all Critical and Important items are resolved.
 4. After the author revises, re-review the specific items you flagged.
+5. After writing your review: `swarm task update <review_task_id> --state completed`
+6. Notify the author: `swarm send <author> "Review done. Verdict: <V>. Read: <result_path>"`
 
 ### Review Flow
 
@@ -192,6 +198,7 @@ Rules for the reviewer:
 Author finishes work
   -> swarm review <task_id> --reviewer <other_agent>
 Reviewer reads artifact, writes structured review
+  -> swarm task update <review_task_id> --state completed
   -> swarm send <author> "Review done. Verdict: REVISE. Read: <result_path>"
 Author reads review, addresses ALL Critical + Important items
   -> swarm review <task_id> --reviewer <same_agent>  (creates _r2)
