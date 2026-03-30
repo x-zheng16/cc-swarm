@@ -121,6 +121,10 @@ if [ -f "$CARD_FILE" ]; then
     jq -s '.[0] * .[1]' "$CARD_FILE" <(echo "$NEW_FIELDS") > "$CARD_FILE.tmp" \
         && mv "$CARD_FILE.tmp" "$CARD_FILE"
 else
+    # Apply migrated metadata from old card (if rename happened)
+    if [ -n "$MIGRATED_FIELDS" ] && [ "$MIGRATED_FIELDS" != "{}" ]; then
+        NEW_FIELDS=$(echo "$NEW_FIELDS" | jq --argjson mf "$MIGRATED_FIELDS" '. * $mf')
+    fi
     echo "$NEW_FIELDS" > "$CARD_FILE"
 fi
 
