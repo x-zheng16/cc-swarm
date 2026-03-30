@@ -33,8 +33,8 @@ else
     TMUX_BIN="tmux"
 fi
 
-# Get pane target: session_name:window_index.pane_index
-PANE_TARGET=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "")
+# Get pane target: session_name:window_name.pane_index (name is stable; index shifts on delete)
+PANE_TARGET=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
 if [ -z "$PANE_TARGET" ]; then
     exit 0
 fi

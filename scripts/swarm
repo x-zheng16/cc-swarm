@@ -288,7 +288,7 @@ cmd_list() {
         else
             printf "%-15s %-8s %-30s %s\n" "$target" "$status" "$name" "$display_cwd"
         fi
-    done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_index}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
+    done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_name}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
 }
 
 cmd_dispatch() {
@@ -593,7 +593,7 @@ cmd_status() {
         local display_cwd="${pane_path/#$HOME/~}"
 
         printf "%-15s %-8s %-25s %s\n" "$target" "$status" "$last_line" "$display_cwd"
-    done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_index}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
+    done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_name}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
 
     echo ""
     echo "Total: $total | Idle: $idle | Busy: $busy | Unknown: $((total - idle - busy))"
@@ -708,7 +708,7 @@ cmd_register_all() {
         else
             echo "  $target — could not determine session ID"
         fi
-    done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_index}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
+    done < <($TMUX_BIN list-panes -a -F "#{session_name}	#{window_name}	#{pane_index}	#{pane_current_command}	#{pane_title}	#{pane_current_path}" 2>/dev/null)
 
     echo ""
     echo "Registered $count sessions."
@@ -787,10 +787,10 @@ cmd_launch() {
         # Create new tmux window (-d = don't steal focus)
         local target
         if [ -n "$start_window" ] && [ $i -eq 1 ]; then
-            target=$($TMUX_BIN new-window -d -t "${session}:${start_window}" -P -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) \
+            target=$($TMUX_BIN new-window -d -t "${session}:${start_window}" -P -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null) \
                 || target="${session}:${start_window}.0"
         else
-            target=$($TMUX_BIN new-window -d -t "${session}" -P -F '#{session_name}:#{window_index}.#{pane_index}')
+            target=$($TMUX_BIN new-window -d -t "${session}" -P -F '#{session_name}:#{window_name}.#{pane_index}')
         fi
 
         # Rename tmux window if name provided
@@ -845,7 +845,7 @@ cmd_send() {
     # Get sender identity
     local sender="unknown"
     if [ -n "${TMUX:-}" ]; then
-        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "unknown")
+        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     local timestamp
@@ -873,7 +873,7 @@ cmd_inbox() {
     # Determine current agent's pane target
     local my_pane="unknown"
     if [ -n "${TMUX:-}" ]; then
-        my_pane=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "unknown")
+        my_pane=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     # Check for --target override (for reading another agent's inbox)
@@ -942,7 +942,7 @@ cmd_ask() {
     # Get sender identity
     local sender="unknown"
     if [ -n "${TMUX:-}" ]; then
-        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "unknown")
+        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     # Generate QA ID: qa_{timestamp}_{short_hash}
@@ -1011,7 +1011,7 @@ cmd_reply() {
     # Get sender identity
     local sender="unknown"
     if [ -n "${TMUX:-}" ]; then
-        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "unknown")
+        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     local timestamp
@@ -1292,7 +1292,7 @@ cmd_card() {
             if [ -z "$target" ]; then
                 # Auto-detect from tmux
                 if [ -n "${TMUX:-}" ]; then
-                    target=$($TMUX_BIN display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "")
+                    target=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
                 fi
                 if [ -z "$target" ]; then
                     echo "Usage: swarm card <target> | swarm card set-role|set-team|set-caps <target> <value>" >&2
@@ -2343,7 +2343,7 @@ cmd_monitor_start() {
         | grep ':monitor\.' | head -1)
 
     if [ -z "$monitor_target" ]; then
-        monitor_target=$($TMUX_BIN list-panes -t "${session}" -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+        monitor_target=$($TMUX_BIN list-panes -t "${session}" -a -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null \
             | tail -1)
     fi
 
