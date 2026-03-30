@@ -127,6 +127,54 @@ create_branch_with_changes() {
     [[ "$output" == *"Aborting"* ]]
 }
 
+# --- auto-detects worktree branches ---
+
+@test "merge: auto-detects worktree branches (no --sources)" {
+    create_branch_with_changes "wt-alpha" "alpha.txt" "alpha"
+    create_branch_with_changes "wt-beta" "beta.txt" "beta"
+
+    # Create worktrees for those branches
+    git -C "$TEST_REPO" worktree add "$BATS_TMPDIR/wt_alpha_$$" wt-alpha 2>/dev/null
+    git -C "$TEST_REPO" worktree add "$BATS_TMPDIR/wt_beta_$$" wt-beta 2>/dev/null
+
+    run "$SWARM_SCRIPT" merge --base main --dry-run --repo "$TEST_REPO"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"wt-alpha"* ]]
+    [[ "$output" == *"wt-beta"* ]]
+    [[ "$output" == *"2 branch"* ]]
+
+    # Cleanup worktrees
+    git -C "$TEST_REPO" worktree remove "$BATS_TMPDIR/wt_alpha_$$" 2>/dev/null || true
+    git -C "$TEST_REPO" worktree remove "$BATS_TMPDIR/wt_beta_$$" 2>/dev/null || true
+}
+
+# --- --force skips conflict check ---
+
+@test "merge: --force merges clean branches despite conflicts" {
+    create_branch_with_changes "ok-branch" "ok.txt" "ok content"
+
+    # Create a conflicting branch
+    git -C "$TEST_REPO" checkout -b "conflict-force" main
+    echo "force version" > "$TEST_REPO/base.txt"
+    git -C "$TEST_REPO" add base.txt
+    git -C "$TEST_REPO" commit -m "force conflict"
+    git -C "$TEST_REPO" checkout main
+    echo "main force version" > "$TEST_REPO/base.txt"
+    git -C "$TEST_REPO" add base.txt
+    git -C "$TEST_REPO" commit -m "main force"
+
+    # Without --force: would abort. With --force: merges clean branches only.
+    run "$SWARM_SCRIPT" merge --base main --sources ok-branch,conflict-force \
+        --force --repo "$TEST_REPO"
+    # Should succeed (merges what it can)
+    [[ "$output" == *"CONFLICT"* ]]
+    [[ "$output" == *"Merged ok-branch"* ]]
+
+    # Verify ok.txt made it to main
+    git -C "$TEST_REPO" checkout main
+    [ -f "$TEST_REPO/ok.txt" ]
+}
+
 # --- fails when no sources ---
 
 @test "merge: fails when no source branches found" {

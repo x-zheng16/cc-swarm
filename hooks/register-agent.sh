@@ -33,8 +33,33 @@ else
     TMUX_BIN="tmux"
 fi
 
+# Resolve pane target for display-message: use $TMUX_PANE if available (always correct),
+# fall back to no -t (may return focused pane — less reliable but better than nothing).
+DISPLAY_TARGET="${TMUX_PANE:-}"
+DISPLAY_FLAG=""
+if [ -n "$DISPLAY_TARGET" ]; then
+    DISPLAY_FLAG="-t $DISPLAY_TARGET"
+fi
+
+# Sync pane title -> window name FIRST (before reading PANE_TARGET)
+# shellcheck disable=SC2086
+PANE_INFO=$($TMUX_BIN display-message -p $DISPLAY_FLAG '#{pane_id}|#{pane_title}' 2>/dev/null || echo "")
+PANE_ID="${PANE_INFO%%|*}"
+PANE_TITLE="${PANE_INFO#*|}"
+if [ -n "$PANE_TITLE" ] && [ -n "$PANE_ID" ]; then
+    # Strip non-ASCII (unicode status icons: braille spinners, sparkles) + leading whitespace
+    # Preserves ASCII punctuation like [impl] prefixes
+    CLEAN_NAME=$(printf '%s' "$PANE_TITLE" | LC_ALL=C sed 's/[^[:print:]]//g' | sed 's/^[[:space:]]*//')
+    if [ -n "$CLEAN_NAME" ]; then
+        $TMUX_BIN rename-window -t "$PANE_ID" "$CLEAN_NAME" 2>/dev/null || true
+    fi
+fi
+
 # Get pane target: session_name:window_name.pane_index (name is stable; index shifts on delete)
-PANE_TARGET=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
+# Read AFTER rename so window_name reflects the synced value
+# Use PANE_ID (from above) for -t to ensure we read OUR pane, not the focused one
+# shellcheck disable=SC2086
+PANE_TARGET=$($TMUX_BIN display-message -p -t "${PANE_ID:-$DISPLAY_TARGET}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
 if [ -z "$PANE_TARGET" ]; then
     exit 0
 fi
@@ -71,7 +96,7 @@ NEW_FIELDS=$(jq -n \
     --arg session_id "$SESSION_ID" \
     --arg cwd "$CWD" \
     --arg jsonl_path "$JSONL_PATH" \
-    --argjson pid "$($TMUX_BIN display-message -p '#{pane_pid}' 2>/dev/null || echo 0)" \
+    --argjson pid "$($TMUX_BIN display-message -p -t "${PANE_ID:-${TMUX_PANE:-}}" '#{pane_pid}' 2>/dev/null || echo 0)" \
     --arg status "$STATUS" \
     --arg event "$EVENT" \
     --arg registered_at "$TIMESTAMP" \
@@ -88,7 +113,7 @@ fi
 # Heartbeat: always update timestamp on every hook fire
 NEW_FIELDS=$(echo "$NEW_FIELDS" | jq --arg ts "$TIMESTAMP" '. + {last_heartbeat: $ts}')
 
-# Merge-update: preserve v2 fields (role, team, capabilities, current_task)
+# Merge-update: preserve existing fields (role, team, capabilities, current_task)
 CARD_FILE="$AGENTS_DIR/${SAFE_NAME}.json"
 if [ -f "$CARD_FILE" ]; then
     # Clear current_task when agent goes idle (task completed)
@@ -104,12 +129,3 @@ else
     echo "$NEW_FIELDS" > "$CARD_FILE"
 fi
 
-# Sync pane title -> window name (so tmux tab bar shows session name)
-PANE_TITLE=$($TMUX_BIN display-message -p '#{pane_title}' 2>/dev/null || echo "")
-if [ -n "$PANE_TITLE" ]; then
-    # Strip leading status icons (⠐ ✳ and braille spinners)
-    CLEAN_NAME=$(echo "$PANE_TITLE" | sed 's/^[^a-zA-Z0-9]*//')
-    if [ -n "$CLEAN_NAME" ]; then
-        $TMUX_BIN rename-window -t "$PANE_TARGET" "$CLEAN_NAME" 2>/dev/null || true
-    fi
-fi

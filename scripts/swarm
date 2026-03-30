@@ -292,16 +292,19 @@ cmd_list() {
 }
 
 cmd_dispatch() {
-    local target="$1"
-    shift
-
+    local target=""
+    local task_id=""
     local prompt=""
     local prompt_file=""
     local force=false
 
-    # Parse args
+    # Parse args: either --task <id> or <target> <prompt|--file path>
     while [ $# -gt 0 ]; do
         case "$1" in
+            --task)
+                task_id="$2"
+                shift 2
+                ;;
             --file)
                 prompt_file="$2"
                 shift 2
@@ -311,90 +314,205 @@ cmd_dispatch() {
                 shift
                 ;;
             *)
-                if [ -z "$prompt" ]; then
+                if [ -z "$target" ]; then
+                    target="$1"
+                    shift
+                elif [ -z "$prompt" ]; then
                     prompt="$*"
                     break
+                else
+                    shift
                 fi
                 ;;
         esac
     done
 
-    # Validate target
-    if ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
-        echo "Error: tmux session '${target%%:*}' not found" >&2
-        echo "Available sessions:" >&2
-        $TMUX_BIN list-sessions -F '  #{session_name}' 2>/dev/null >&2
+    # --- If no --task, auto-create task from target + prompt ---
+    if [ -z "$task_id" ]; then
+        if [ -z "$target" ]; then
+            echo "Usage: swarm dispatch <target> <prompt|--file path|--task task_id>" >&2
+            exit 1
+        fi
+
+        # Resolve prompt content
+        local prompt_content=""
+        if [ -n "$prompt_file" ]; then
+            if [ ! -f "$prompt_file" ]; then
+                echo "Error: File not found: $prompt_file" >&2
+                exit 1
+            fi
+            prompt_content=$(cat "$prompt_file")
+        elif [ -n "$prompt" ]; then
+            prompt_content="$prompt"
+        else
+            echo "Error: No prompt provided" >&2
+            exit 1
+        fi
+
+        # Auto-generate task_id and detect caller pane
+        task_id="auto_$(date +%Y%m%d_%H%M%S)_$$"
+        local from_pane=""
+        if [ -n "${TMUX:-}" ]; then
+            from_pane=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
+        fi
+        : "${from_pane:=unknown}"
+
+        # Create task structure
+        local task_dir="$TASKS_DIR/$task_id"
+        mkdir -p "$task_dir"
+
+        local created_at
+        created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+        jq -n \
+            --arg task_id "$task_id" \
+            --arg from "$from_pane" \
+            --arg to "$target" \
+            --arg type "task" \
+            --arg created "$created_at" \
+            --arg result_path "$task_dir/result.md" \
+            '{task_id: $task_id, from: $from, to: $to, type: $type, created_at: $created,
+              result_path: $result_path}' \
+            > "$task_dir/envelope.json"
+
+        echo "$prompt_content" > "$task_dir/prompt.md"
+
+        jq -n --arg ts "$created_at" \
+            '{state: "created", created_at: $ts, transitions: [{from: "none", to: "created", at: $ts}]}' \
+            > "$task_dir/status.json"
+    fi
+
+    # --- Dispatch the task ---
+    local task_dir="$TASKS_DIR/$task_id"
+
+    # Validate task directory structure
+    if [ ! -d "$task_dir" ]; then
+        echo "Error: task directory not found: $task_dir" >&2
+        exit 1
+    fi
+    for required_file in envelope.json prompt.md status.json; do
+        if [ ! -f "$task_dir/$required_file" ]; then
+            echo "Error: $required_file missing in $task_dir" >&2
+            exit 1
+        fi
+    done
+
+    # Read envelope
+    local env_task_id env_from env_to
+    env_task_id=$(jq -r '.task_id // empty' "$task_dir/envelope.json")
+    env_from=$(jq -r '.from // empty' "$task_dir/envelope.json")
+    env_to=$(jq -r '.to // empty' "$task_dir/envelope.json")
+
+    if [ -z "$env_task_id" ] || [ -z "$env_from" ] || [ -z "$env_to" ]; then
+        echo "Error: envelope.json missing required fields (task_id, from, to)" >&2
         exit 1
     fi
 
-    # Check if CC is running
+    target="$env_to"
+
+    # Dedup check + status update (atomic, under lock to prevent TOCTOU race)
+    local lock_dir="$SWARM_DIR/locks/dispatch_${task_id}"
+    local current_state timestamp
+
+    _dispatch_dedup_and_transition() {
+        current_state=$(jq -r '.state' "$task_dir/status.json")
+        if [ "$current_state" = "dispatched" ] && ! $force; then
+            echo "Error: task '$task_id' already dispatched. Use --force to re-dispatch." >&2
+            return 1
+        fi
+        timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        jq --arg ts "$timestamp" --arg prev "$current_state" '
+            .state = "dispatched" |
+            .dispatched_at = $ts |
+            .transitions += [{from: $prev, to: "dispatched", at: $ts}]
+        ' "$task_dir/status.json" > "$task_dir/status.json.tmp" \
+            && mv "$task_dir/status.json.tmp" "$task_dir/status.json"
+    }
+
+    mkdir -p "$SWARM_DIR/locks"
+    if ! with_lock "$lock_dir" _dispatch_dedup_and_transition; then
+        exit 1
+    fi
+
+    # Update target agent's card
+    local safe_target
+    safe_target=$(echo "$target" | tr ':.' '_')
+    local card_file="$AGENTS_DIR/${safe_target}.json"
+    if [ -f "$card_file" ]; then
+        jq --arg tid "$task_id" '.current_task = $tid' "$card_file" > "$card_file.tmp" \
+            && mv "$card_file.tmp" "$card_file"
+    fi
+
+    # Append notification instruction to prompt.md
+    # On --force re-dispatch, use current dispatcher's pane (not original envelope's from)
+    local notify_target="$env_from"
+    if $force && [ -n "${TMUX:-}" ]; then
+        local current_pane
+        current_pane=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
+        [ -n "$current_pane" ] && notify_target="$current_pane"
+    fi
+
+    # Remove old notification footer before appending updated one
+    if $force && grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
+        sed -i '' '/^---$/,/^```$/{ /swarm send.*done: '"$task_id"'/{ N; d; }; }' "$task_dir/prompt.md" 2>/dev/null || true
+    fi
+
+    if ! grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
+        cat >> "$task_dir/prompt.md" <<NOTIFY
+
+---
+**When you finish this task**, notify the dispatcher:
+\`\`\`bash
+swarm send $notify_target "done: $task_id"
+\`\`\`
+NOTIFY
+    fi
+
+    # Dispatch via tmux
+    if [ -z "${TMUX:-}" ] && ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
+        log_activity "dispatch" "task_id=$task_id" "target=$target"
+        echo "Dispatch prepared: task=$task_id target=$target (tmux unavailable, skipping paste)"
+        return 0
+    fi
+
+    if ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
+        echo "Error: tmux session '${target%%:*}' not found" >&2
+        exit 1
+    fi
+
     if ! is_cc_pane "$target"; then
         echo "Error: $target does not appear to be running Claude Code" >&2
         exit 1
     fi
 
-    # Check idle status
     local status
     status=$(get_status "$target")
-    if [ "$status" = "busy" ] && [ "$force" != "true" ]; then
+    if [ "$status" = "busy" ] && ! $force; then
         echo "Warning: $target appears busy (status: $status). Use --force to send anyway." >&2
-        echo "Current pane content:" >&2
-        $TMUX_BIN capture-pane -t "$target" -p | tail -3 >&2
         exit 1
     fi
 
-    # Send the prompt
-    local buf_name="swarm_$$_$(date +%s%N)"
-    if [ -n "$prompt_file" ]; then
-        if [ ! -f "$prompt_file" ]; then
-            echo "Error: File not found: $prompt_file" >&2
-            exit 1
-        fi
-        # Send file reference instead of pasting content — let the agent read the file itself
-        local abs_path
-        abs_path=$(cd "$(dirname "$prompt_file")" && echo "$(pwd -P)/$(basename "$prompt_file")")
-        local ref_msg="Read and execute the task in $abs_path"
-        echo "$ref_msg" | $TMUX_BIN load-buffer -b "$buf_name" -
-        $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d
-    else
-        if [ -z "$prompt" ]; then
-            echo "Error: No prompt provided" >&2
-            exit 1
-        fi
-        # Use load-buffer for reliable delivery (handles special chars)
-        echo "$prompt" | $TMUX_BIN load-buffer -b "$buf_name" -
-        $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d
-    fi
-
-    # Send Enter to submit
+    # Send "Read and execute" message
+    local dispatch_msg="Read and execute the task in $task_dir/prompt.md"
+    local buf_name="swarm_$$_$(date +%s)_$RANDOM"
+    echo "$dispatch_msg" | $TMUX_BIN load-buffer -b "$buf_name" -
+    $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d
     sleep 0.3
     $TMUX_BIN send-keys -t "$target" Enter
 
-    # Log the dispatch
-    local timestamp
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    local safe_target
-    safe_target=$(echo "$target" | tr ':.' '_')
-    local log_file="$DISPATCH_DIR/${timestamp}_${safe_target}.json"
-
-    local content
-    if [ -n "$prompt_file" ]; then
-        content="(file: $prompt_file)"
-    else
-        content="$prompt"
-    fi
-
+    # Log dispatch event
+    local log_file="$DISPATCH_DIR/$(date +%Y%m%d_%H%M%S)_${safe_target}.json"
     jq -n \
         --arg target "$target" \
-        --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-        --arg content "$content" \
+        --arg task_id "$task_id" \
+        --arg timestamp "$timestamp" \
         --arg status "$status" \
-        '{target: $target, timestamp: $timestamp, content: $content, status_at_dispatch: $status}' \
+        '{target: $target, task_id: $task_id, timestamp: $timestamp,
+          status_at_dispatch: $status}' \
         > "$log_file"
 
-    log_activity "dispatch" "target=$target" "mode=v1"
-    echo "Dispatched to $target (was: $status)"
-    echo "Log: $log_file"
+    log_activity "dispatch" "task_id=$task_id" "target=$target"
+    echo "Dispatched: task=$task_id -> $target (was: $status)"
 }
 
 cmd_monitor() {
@@ -845,7 +963,7 @@ cmd_send() {
     # Get sender identity
     local sender="unknown"
     if [ -n "${TMUX:-}" ]; then
-        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
+        sender=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     local timestamp
@@ -858,7 +976,7 @@ cmd_send() {
     # Push notification via tmux (queued if target is busy)
     if $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
         local notify_msg="[swarm:$sender] $message"
-        local buf_name="swarm_notify_$$_$(date +%s%N)"
+        local buf_name="swarm_notify_$$_$(date +%s)_$RANDOM"
         echo "$notify_msg" | $TMUX_BIN load-buffer -b "$buf_name" - 2>/dev/null
         $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d 2>/dev/null
         sleep 0.3
@@ -873,7 +991,7 @@ cmd_inbox() {
     # Determine current agent's pane target
     local my_pane="unknown"
     if [ -n "${TMUX:-}" ]; then
-        my_pane=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
+        my_pane=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     # Check for --target override (for reading another agent's inbox)
@@ -942,7 +1060,7 @@ cmd_ask() {
     # Get sender identity
     local sender="unknown"
     if [ -n "${TMUX:-}" ]; then
-        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
+        sender=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     # Generate QA ID: qa_{timestamp}_{short_hash}
@@ -1011,7 +1129,7 @@ cmd_reply() {
     # Get sender identity
     local sender="unknown"
     if [ -n "${TMUX:-}" ]; then
-        sender=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
+        sender=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
     fi
 
     local timestamp
@@ -1085,7 +1203,7 @@ cmd_qa_list() {
     fi
 }
 
-# --- Task lifecycle (v2) ---
+# --- Task lifecycle ---
 
 cmd_task() {
     local subcmd="${1:-}"
@@ -1277,7 +1395,7 @@ cmd_task_list() {
     done
 }
 
-# --- Agent card (v2) ---
+# --- Agent card ---
 
 cmd_card() {
     local subcmd="${1:-}"
@@ -1292,7 +1410,7 @@ cmd_card() {
             if [ -z "$target" ]; then
                 # Auto-detect from tmux
                 if [ -n "${TMUX:-}" ]; then
-                    target=$($TMUX_BIN display-message -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
+                    target=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
                 fi
                 if [ -z "$target" ]; then
                     echo "Usage: swarm card <target> | swarm card set-role|set-team|set-caps <target> <value>" >&2
@@ -1362,176 +1480,6 @@ cmd_card_set_caps() {
     echo "Set capabilities for $target"
 }
 
-# --- V2 Dispatch Protocol ---
-
-cmd_dispatch_v2() {
-    local task_id=""
-    local force=false
-
-    # Parse args
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --task)
-                task_id="$2"
-                shift 2
-                ;;
-            --force)
-                force=true
-                shift
-                ;;
-            *)
-                # Ignore positional args (target comes from envelope, not CLI)
-                shift
-                ;;
-        esac
-    done
-
-    if [ -z "$task_id" ]; then
-        echo "Error: --task requires a task_id" >&2
-        exit 1
-    fi
-
-    # 1. Validate task directory exists
-    local task_dir="$TASKS_DIR/$task_id"
-    if [ ! -d "$task_dir" ]; then
-        echo "Error: task '$task_id' not found (no directory at $task_dir)" >&2
-        exit 1
-    fi
-
-    # 2. Validate envelope.json exists
-    if [ ! -f "$task_dir/envelope.json" ]; then
-        echo "Error: envelope.json missing in $task_dir" >&2
-        exit 1
-    fi
-
-    # 3. Validate prompt.md exists
-    if [ ! -f "$task_dir/prompt.md" ]; then
-        echo "Error: prompt.md missing in $task_dir — create task with --prompt or write it manually" >&2
-        exit 1
-    fi
-
-    # 4. Read and validate envelope required fields
-    local env_task_id env_from env_to
-    env_task_id=$(jq -r '.task_id // empty' "$task_dir/envelope.json")
-    env_from=$(jq -r '.from // empty' "$task_dir/envelope.json")
-    env_to=$(jq -r '.to // empty' "$task_dir/envelope.json")
-
-    if [ -z "$env_task_id" ]; then
-        echo "Error: envelope.json missing required field 'task_id'" >&2
-        exit 1
-    fi
-    if [ -z "$env_from" ]; then
-        echo "Error: envelope.json missing required field 'from'" >&2
-        exit 1
-    fi
-    if [ -z "$env_to" ]; then
-        echo "Error: envelope.json missing required field 'to'" >&2
-        exit 1
-    fi
-
-    local target="$env_to"
-
-    # 4b. Dedup check: reject if already dispatched (unless --force)
-    local current_state
-    current_state=$(jq -r '.state' "$task_dir/status.json")
-    if [ "$current_state" = "dispatched" ] && ! $force; then
-        echo "Error: task '$task_id' already dispatched. Use --force to re-dispatch." >&2
-        exit 1
-    fi
-
-    # 5. Update status.json: state -> dispatched, add dispatched_at and transition
-    local timestamp
-    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local prev_state="$current_state"
-
-    jq --arg ts "$timestamp" --arg prev "$prev_state" '
-        .state = "dispatched" |
-        .dispatched_at = $ts |
-        .transitions += [{from: $prev, to: "dispatched", at: $ts}]
-    ' "$task_dir/status.json" > "$task_dir/status.json.tmp" \
-        && mv "$task_dir/status.json.tmp" "$task_dir/status.json"
-
-    # 6. Update the target agent's card: set current_task
-    local safe_target
-    safe_target=$(echo "$target" | tr ':.' '_')
-    local card_file="$AGENTS_DIR/${safe_target}.json"
-    if [ -f "$card_file" ]; then
-        jq --arg tid "$task_id" '.current_task = $tid' "$card_file" > "$card_file.tmp" \
-            && mv "$card_file.tmp" "$card_file"
-    fi
-
-    # 7. Append completion notification instruction to prompt.md (skip if already present)
-    if ! grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
-        cat >> "$task_dir/prompt.md" <<NOTIFY
-
----
-**When you finish this task**, notify the dispatcher:
-\`\`\`bash
-swarm send $env_from "done: $task_id"
-\`\`\`
-NOTIFY
-    fi
-
-    # 8. Dispatch via tmux (skip if no tmux — e.g. test environment)
-    if [ -z "${TMUX:-}" ] && ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
-        log_activity "dispatch" "task_id=$task_id" "target=$target" "mode=v2"
-        echo "V2 dispatch prepared: task=$task_id target=$target (tmux unavailable, skipping paste)"
-        return 0
-    fi
-
-    # Validate tmux target
-    if ! $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
-        echo "Error: tmux session '${target%%:*}' not found" >&2
-        echo "Available sessions:" >&2
-        $TMUX_BIN list-sessions -F '  #{session_name}' 2>/dev/null >&2
-        exit 1
-    fi
-
-    # Check if CC is running
-    if ! is_cc_pane "$target"; then
-        echo "Error: $target does not appear to be running Claude Code" >&2
-        exit 1
-    fi
-
-    # Check idle status
-    local status
-    status=$(get_status "$target")
-    if [ "$status" = "busy" ] && [ "$force" != "true" ]; then
-        echo "Warning: $target appears busy (status: $status). Use --force to send anyway." >&2
-        exit 1
-    fi
-
-    # Send dispatch message: read and execute the task prompt
-    local abs_prompt_path="$task_dir/prompt.md"
-    local dispatch_msg="Read and execute the task in $abs_prompt_path"
-    local buf_name="swarm_$$_$(date +%s%N)"
-
-    echo "$dispatch_msg" | $TMUX_BIN load-buffer -b "$buf_name" -
-    $TMUX_BIN paste-buffer -b "$buf_name" -t "$target" -d
-
-    # Send Enter
-    sleep 0.3
-    $TMUX_BIN send-keys -t "$target" Enter
-
-    # Log
-    local safe_log
-    safe_log=$(echo "$target" | tr ':.' '_')
-    local log_file="$DISPATCH_DIR/$(date +%Y%m%d_%H%M%S)_${safe_log}.json"
-    jq -n \
-        --arg target "$target" \
-        --arg task_id "$task_id" \
-        --arg timestamp "$timestamp" \
-        --arg content "(task: $task_id)" \
-        --arg status "$status" \
-        --argjson version 2 \
-        '{target: $target, task_id: $task_id, timestamp: $timestamp,
-          content: $content, status_at_dispatch: $status, version: $version}' \
-        > "$log_file"
-
-    echo "V2 dispatched: task=$task_id -> $target (was: $status)"
-    echo "Log: $log_file"
-}
-
 # --- Topology helpers ---
 
 # Ensure topology.json exists with base structure
@@ -1547,7 +1495,7 @@ EOF
     fi
 }
 
-# --- Team management (v2) ---
+# --- Team management ---
 
 cmd_team() {
     local subcmd="${1:-}"
@@ -1806,7 +1754,7 @@ cmd_topology() {
     fi
 }
 
-# --- Review Exchange Protocol (v2) ---
+# --- Review Exchange Protocol ---
 
 cmd_review() {
     local source_task_id="" reviewer="" artifact_path=""
@@ -2105,6 +2053,160 @@ cmd_log() {
         '"\(.timestamp)  \(.action)\t\(to_entries | map(select(.key != "action" and .key != "timestamp")) | map("\(.key)=\(.value)") | join(" "))"'
 }
 
+# --- Triage: review result -> Linear tickets ---
+
+cmd_triage() {
+    local task_id="" dry_run=false min_severity="minor" linear_bin="linear"
+
+    # Parse args
+    if [ $# -lt 1 ] || [[ "$1" == --* ]]; then
+        echo "Usage: swarm triage <task_id> [--dry-run] [--min-severity critical|important|minor] [--linear-bin path]" >&2
+        exit 1
+    fi
+    task_id="$1"; shift
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run)       dry_run=true; shift ;;
+            --min-severity)  min_severity="$2"; shift 2 ;;
+            --linear-bin)    linear_bin="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    local task_dir="$SWARM_DIR/tasks/$task_id"
+    local result_file="$task_dir/result.md"
+
+    if [ ! -f "$result_file" ]; then
+        echo "Error: $result_file not found" >&2
+        exit 1
+    fi
+
+    # Severity level to numeric (for filtering)
+    _severity_num() {
+        case "$1" in
+            critical) echo 1 ;;
+            important) echo 2 ;;
+            minor) echo 3 ;;
+            *) echo 4 ;;
+        esac
+    }
+
+    local min_sev_num
+    min_sev_num=$(_severity_num "$min_severity")
+
+    # Parse structured tables under ### Critical / ### Important / ### Minor headers
+    local current_severity="" issue_count=0
+    local -a issues=()  # "severity|id|confidence|location|description"
+
+    while IFS= read -r line; do
+        # Detect severity header
+        if echo "$line" | grep -qiE '^###\s+Critical'; then
+            current_severity="critical"
+            continue
+        elif echo "$line" | grep -qiE '^###\s+Important'; then
+            current_severity="important"
+            continue
+        elif echo "$line" | grep -qiE '^###\s+(Minor|Nice)'; then
+            current_severity="minor"
+            continue
+        elif echo "$line" | grep -qE '^##[^#]'; then
+            # New section -- reset severity context
+            current_severity=""
+            continue
+        fi
+
+        # Skip non-table lines and header/separator rows
+        if [ -z "$current_severity" ]; then continue; fi
+        if ! echo "$line" | grep -q '|'; then continue; fi
+        if echo "$line" | grep -qE '^\|\s*[-]+'; then continue; fi
+        if echo "$line" | grep -qiE '^\|\s*#\s*\|'; then continue; fi
+
+        # Parse table row: | id | confidence | location | issue |
+        local issue_id confidence location description
+        issue_id=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+        confidence=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $3); print $3}')
+        location=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $4); print $4}')
+        description=$(echo "$line" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $5); print $5}')
+
+        if [ -z "$issue_id" ] || [ -z "$description" ]; then continue; fi
+
+        # Strip markdown bold markers from description for ticket title
+        local clean_desc
+        clean_desc=$(echo "$description" | sed 's/\*\*//g' | sed 's/ -- .*//')
+
+        issues+=("${current_severity}|${issue_id}|${confidence}|${location}|${clean_desc}|${description}")
+        issue_count=$((issue_count + 1))
+    done < "$result_file"
+
+    if [ $issue_count -eq 0 ]; then
+        echo "Error: No structured issues found in $result_file" >&2
+        exit 1
+    fi
+
+    echo "Found $issue_count issue(s) in $task_id"
+    echo ""
+
+    # Process issues
+    local created=0 skipped=0
+    local -a ticket_ids=()
+
+    for entry in "${issues[@]}"; do
+        IFS='|' read -r severity issue_id confidence location clean_desc full_desc <<< "$entry"
+
+        local sev_num
+        sev_num=$(_severity_num "$severity")
+
+        # Filter by min severity
+        if [ "$sev_num" -gt "$min_sev_num" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Map severity to Linear priority
+        local priority
+        priority=$sev_num
+
+        local sev_upper
+        sev_upper=$(echo "$severity" | tr '[:lower:]' '[:upper:]' | head -c1)$(echo "$severity" | tail -c+2)
+
+        if $dry_run; then
+            printf "  [DRY RUN] %-10s %-6s P%d  %s: %s\n" "$sev_upper" "$issue_id" "$priority" "$location" "$clean_desc"
+            created=$((created + 1))
+        else
+            # Create Linear ticket
+            local ticket_body="**${issue_id}** (${confidence}) at ${location}\n\n${full_desc}\n\nSource: swarm triage ${task_id}"
+            local ticket_id
+            ticket_id=$("$linear_bin" i create "$clean_desc" \
+                --priority "$priority" \
+                2>/dev/null | grep -oE '[A-Z]+-[0-9]+' | head -1)
+
+            if [ -n "$ticket_id" ]; then
+                printf "  %-10s %-6s -> %s (P%d)\n" "$sev_upper" "$issue_id" "$ticket_id" "$priority"
+                ticket_ids+=("$ticket_id")
+                created=$((created + 1))
+            else
+                echo "  Warning: failed to create ticket for $issue_id" >&2
+            fi
+        fi
+    done
+
+    echo ""
+    if $dry_run; then
+        echo "DRY RUN: would create $created ticket(s), skipped $skipped"
+    else
+        echo "Created $created ticket(s): ${ticket_ids[*]}"
+
+        # Log to activity
+        local timestamp
+        timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        local ticket_csv
+        ticket_csv=$(IFS=','; echo "${ticket_ids[*]}")
+        echo "{\"timestamp\":\"$timestamp\",\"action\":\"triage\",\"task_id\":\"$task_id\",\"tickets\":\"$ticket_csv\",\"count\":$created}" \
+            >> "$SWARM_DIR/activity.jsonl"
+    fi
+}
+
 # --- Merge coordinator ---
 
 cmd_merge() {
@@ -2306,7 +2408,7 @@ cmd_monitor_start() {
 
     if [ -z "$session" ]; then
         if [ -n "${TMUX:-}" ]; then
-            session=$($TMUX_BIN display-message -p '#{session_name}' 2>/dev/null || echo "")
+            session=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}' 2>/dev/null || echo "")
         fi
     fi
 
@@ -2401,6 +2503,100 @@ cmd_monitor_status() {
     fi
 }
 
+# --- Rename: atomic 3-layer name update ---
+
+cmd_rename() {
+    local name="" target="" old_pane="" card_only=false
+
+    # Parse args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --target|-t) target="$2"; shift 2 ;;
+            --old-pane)  old_pane="$2"; shift 2 ;;
+            --card-only) card_only=true; shift ;;
+            --*)         echo "Unknown option: $1" >&2; exit 1 ;;
+            *)           name="$1"; shift ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        echo "Usage: swarm rename <name> [--target <pane>]" >&2
+        echo "  Atomically updates CC session name, pane title, and tmux window name." >&2
+        echo "  <name> can include prefix: '[dev] my-feature' -> window_name='my-feature'" >&2
+        exit 1
+    fi
+
+    # Extract window_name by stripping [prefix] if present
+    local window_name="$name"
+    if [[ "$name" =~ ^\[.*\]\ (.+)$ ]]; then
+        window_name="${BASH_REMATCH[1]}"
+    fi
+
+    # Determine pane target and session info
+    local pane_target="" session_name="" pane_index=""
+
+    if ! $card_only; then
+        if [ -z "${TMUX:-}" ]; then
+            echo "Error: not inside tmux — cannot rename" >&2
+            exit 1
+        fi
+
+        if [ -z "$target" ]; then
+            # Rename self
+            target="$TMUX_PANE"
+        fi
+
+        # Read current identity before rename
+        if [ -z "$old_pane" ]; then
+            old_pane=$($TMUX_BIN display-message -t "$target" -p \
+                '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
+        fi
+
+        session_name=$($TMUX_BIN display-message -t "$target" -p '#{session_name}' 2>/dev/null)
+        pane_index=$($TMUX_BIN display-message -t "$target" -p '#{pane_index}' 2>/dev/null)
+
+        # Layer 1: CC session name + pane title (via /rename)
+        $TMUX_BIN send-keys -t "$target" "/rename $name" Enter
+
+        # Layer 2: tmux window name (immediate, no hook wait)
+        $TMUX_BIN rename-window -t "$target" "$window_name"
+
+        pane_target="${session_name}:${window_name}.${pane_index}"
+    else
+        # Card-only mode (testing): derive pane_target from old_pane + new window_name
+        if [ -z "$old_pane" ]; then
+            echo "Error: --card-only requires --old-pane" >&2
+            exit 1
+        fi
+        session_name="${old_pane%%:*}"
+        pane_index="${old_pane##*.}"
+        pane_target="${session_name}:${window_name}.${pane_index}"
+    fi
+
+    # Layer 3: update agent card (rename file + update pane field)
+    if [ -n "$old_pane" ]; then
+        local old_safe new_safe
+        old_safe=$(echo "$old_pane" | tr ':.' '_')
+        new_safe=$(echo "$pane_target" | tr ':.' '_')
+        local old_card="$AGENTS_DIR/${old_safe}.json"
+        local new_card="$AGENTS_DIR/${new_safe}.json"
+
+        if [ -f "$old_card" ]; then
+            if [ "$old_card" = "$new_card" ]; then
+                # Same file — just update pane field
+                jq --arg p "$pane_target" '.pane = $p' "$old_card" > "$old_card.tmp" \
+                    && mv "$old_card.tmp" "$old_card"
+            else
+                # Different file — migrate
+                jq --arg p "$pane_target" '.pane = $p' "$old_card" > "$new_card"
+                rm -f "$old_card"
+            fi
+        fi
+    fi
+
+    echo "Renamed: $pane_target ($name)"
+}
+
 # --- Main ---
 
 case "${1:-}" in
@@ -2430,16 +2626,11 @@ case "${1:-}" in
         ;;
     dispatch|d)
         shift
-        # V2 dispatch: --task flag anywhere in args (target comes from envelope)
-        if [[ " $* " == *" --task "* ]]; then
-            cmd_dispatch_v2 "$@"
-        else
-            if [ $# -lt 2 ]; then
-                echo "Usage: swarm dispatch <target> <prompt|--file path|--task task_id>" >&2
-                exit 1
-            fi
-            cmd_dispatch "$@"
+        if [ $# -lt 1 ]; then
+            echo "Usage: swarm dispatch <target> <prompt|--file path|--task task_id>" >&2
+            exit 1
         fi
+        cmd_dispatch "$@"
         ;;
     monitor|m)
         shift
@@ -2501,6 +2692,10 @@ case "${1:-}" in
         fi
         cmd_launch "$@"
         ;;
+    triage)
+        shift
+        cmd_triage "$@"
+        ;;
     merge)
         shift
         cmd_merge "$@"
@@ -2533,6 +2728,10 @@ case "${1:-}" in
         shift
         cmd_log "$@"
         ;;
+    rename)
+        shift
+        cmd_rename "$@"
+        ;;
     register-all|ra)
         cmd_register_all
         ;;
@@ -2564,9 +2763,9 @@ swarm — Peer-mesh multi-agent coordination over tmux
 Commands:
   list                              List all Claude Code sessions
   launch <session> [options]        Launch CC sessions sequentially in tmux
-  dispatch <target> <prompt>        Send prompt to a CC session
-  dispatch <target> --file <path>   Send file reference (agent reads the file)
-  dispatch --task <id>              V2 dispatch (target from envelope.json)
+  dispatch <target> <prompt>        Send task to a CC session
+  dispatch <target> --file <path>   Send task from file
+  dispatch --task <id>              Dispatch pre-created task (target from envelope)
   task create --id X --from --to   Create a structured task with envelope
   task status <id>                 Show task state
   task list [--state S]            List tasks, optionally filtered by state
@@ -2599,7 +2798,9 @@ Commands:
   cancel-drain <target>              Cancel a drain signal
   check-drain --target <pane>        Check if agent is draining
   log [--last N]                      Show activity log (default: last 50)
+  triage <task_id> [--dry-run]       Parse review result, create Linear tickets
   merge --base B [--sources S1,S2]  Merge worktree branches (conflict-safe)
+  rename <name> [--target <pane>]   Atomic rename (CC + pane title + window name + card)
   register-all                      Force-register all CC sessions
   run <dag.json> [options]          Execute a DAG workflow
 

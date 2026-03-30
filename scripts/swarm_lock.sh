@@ -45,8 +45,8 @@ with_lock() {
     shift
 
     swarm_lock "$lock_dir" || return 1
-    "$@"
-    local rc=$?
+    local rc=0
+    "$@" || rc=$?
     swarm_unlock "$lock_dir"
     return $rc
 }
