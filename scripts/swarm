@@ -77,80 +77,29 @@ require_int() {
 # Check if a pane is running Claude Code
 is_cc_pane() {
     local target="$1"
-    local cmd title
-    cmd=$($TMUX_BIN display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null || echo "")
+    local title
     title=$($TMUX_BIN display-message -t "$target" -p '#{pane_title}' 2>/dev/null || echo "")
-    # CC via compiled binary: command is a version number (e.g. "2.1.85")
-    [[ "$cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0
-    # CC via node (patched cli.js): command is "node", title has CC sparkle prefix
-    [[ "$cmd" == "node" && "$title" == *"✳"* ]] && return 0
-    # Fallback: "Claude Code" in title + not a shell
-    [[ "$title" == *"Claude Code"* && "$cmd" != "zsh" && "$cmd" != "bash" && "$cmd" != "fish" ]] && return 0
+    # CC sets pane_title with status prefix: ✳ (idle) or braille spinner (busy)
+    [[ "$title" == "✳"* || "$title" == "⠂"* || "$title" == "⠐"* ]] && return 0
+    # Fallback: CC startup before session name loads
+    [[ "$title" == *"Claude Code"* ]] && return 0
     return 1
 }
 
-# Check if a CC process has active tool child processes (Bash tool running)
-# Normal CC children are all `node` (plugin workers, MCP servers).
-# /bin/zsh or /bin/bash children = Bash tool invocation.
-has_active_tools() {
-    local target="$1"
-    local pane_pid cc_pid
-    pane_pid=$($TMUX_BIN display-message -t "$target" -p '#{pane_pid}' 2>/dev/null || echo "")
-    [ -z "$pane_pid" ] && return 1
-
-    # Find CC child process (claude or node)
-    cc_pid=$(ps -ax -o pid=,ppid=,comm= 2>/dev/null | awk -v pp="$pane_pid" '$2==pp && ($3~/^claude$/ || $3~/^node$/) {print $1}' | head -1)
-    [ -z "$cc_pid" ] && return 1
-
-    # Check for non-node children (shell = Bash tool, caffeinate = long task, etc.)
-    local tool_procs
-    tool_procs=$(ps -ax -o pid=,ppid=,comm= 2>/dev/null | awk -v pp="$cc_pid" '$2==pp && $3!~/^node$/ {print $3}')
-    [ -n "$tool_procs" ]
-}
-
-# Get idle/busy status of a CC pane
-# Priority: process tree (definitive) > hook-reported (event-driven) > exited
-# No TUI heuristics — hooks + process tree are sufficient.
+# Get idle/busy status of a CC pane from pane_title
+# CC sets pane_title with a status prefix character:
+#   ✳ = idle (waiting for input)
+#   ⠂/⠐ = busy (processing, spinner animation)
 get_status() {
     local target="$1"
-    local safe_name
-    safe_name=$(echo "$target" | tr ':.' '_')
-
-    # 1. Is CC process alive in this pane?
-    local pane_pid cc_pid
-    pane_pid=$($TMUX_BIN display-message -t "$target" -p '#{pane_pid}' 2>/dev/null || echo "")
-    if [ -z "$pane_pid" ]; then
-        echo "exited"
-        return
-    fi
-    cc_pid=$(ps -ax -o pid=,ppid=,comm= 2>/dev/null | awk -v pp="$pane_pid" '$2==pp && ($3~/^claude$/ || $3~/^node$/) {print $1}' | head -1)
-    if [ -z "$cc_pid" ]; then
-        echo "exited"
-        return
-    fi
-
-    # 2. Process tree: active tool children = definitely busy
-    if has_active_tools "$target"; then
-        echo "busy"
-        return
-    fi
-
-    # 3. Hook-reported status — trust if card belongs to current pane process
-    #    Hooks fire on SessionStart (idle), UserPromptSubmit (busy), Stop (idle).
-    #    Card is stale if its pid differs from current pane_pid (new session in same pane).
-    if [ -f "$AGENTS_DIR/${safe_name}.json" ]; then
-        local hook_status card_pid
-        hook_status=$(jq -r '.status // empty' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
-        card_pid=$(jq -r '.pid // 0' "$AGENTS_DIR/${safe_name}.json" 2>/dev/null)
-        if [ -n "$hook_status" ] && [ "$card_pid" = "$pane_pid" ]; then
-            echo "$hook_status"
-            return
-        fi
-        # Card is from a different pane process — stale, ignore it
-    fi
-
-    # 4. CC alive, no tool children, no valid hook → idle (waiting for input)
-    echo "idle"
+    local title
+    title=$($TMUX_BIN display-message -t "$target" -p '#{pane_title}' 2>/dev/null || echo "")
+    case "$title" in
+        "✳"*) echo "idle" ;;
+        "⠂"*|"⠐"*) echo "busy" ;;
+        *"Claude Code"*) echo "idle" ;;
+        *) echo "exited" ;;
+    esac
 }
 
 # Get session ID for a pane from agent registry or filesystem
@@ -275,7 +224,7 @@ cmd_list() {
 
         # Extract session name from pane title (strip leading status icons like ⠐ ✳)
         local name
-        name=$(echo "$pane_title" | sed 's/^[^a-zA-Z]*//' | cut -c1-28)
+        name=$(echo "$pane_title" | sed 's/^[^a-zA-Z[]*//; s/^[[:space:]]*//' | cut -c1-28)
         [ -z "$name" ] && name="(unnamed)"
 
         # Shorten CWD
@@ -725,7 +674,8 @@ cmd_register_all() {
 
     while IFS=$'\t' read -r sess_name win_idx pane_idx pane_cmd pane_title pane_path; do
         local target="${sess_name}:${win_idx}.${pane_idx}"
-        if ! [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! [[ "$pane_cmd" == "node" && "$pane_title" == *"✳"* ]] && ! { [[ "$pane_title" == *"Claude Code"* ]] && [[ "$pane_cmd" != "zsh" && "$pane_cmd" != "bash" && "$pane_cmd" != "fish" ]]; }; then
+        # CC detection: pane_title starts with ✳ (idle) or braille spinner (busy)
+        if ! [[ "$pane_title" == "✳"* || "$pane_title" == "⠂"* || "$pane_title" == "⠐"* || "$pane_title" == *"Claude Code"* ]]; then
             continue
         fi
 
@@ -1928,7 +1878,7 @@ cmd_heartbeat() {
     for card in "${cards[@]}"; do
         local pane status hb liveness age_str
         pane=$(jq -r '.pane // "?"' "$card")
-        status=$(jq -r '.status // "?"' "$card")
+        status=$(get_status "$pane" 2>/dev/null || echo "?")
         hb=$(jq -r '.last_heartbeat // empty' "$card")
 
         if [ -z "$hb" ]; then

@@ -41,23 +41,12 @@ if [ -n "$DISPLAY_TARGET" ]; then
     DISPLAY_FLAG="-t $DISPLAY_TARGET"
 fi
 
-# Sync pane title -> window name FIRST (before reading PANE_TARGET)
+# Get pane ID for reliable targeting
 # shellcheck disable=SC2086
-PANE_INFO=$($TMUX_BIN display-message -p $DISPLAY_FLAG '#{pane_id}|#{pane_title}' 2>/dev/null || echo "")
-PANE_ID="${PANE_INFO%%|*}"
-PANE_TITLE="${PANE_INFO#*|}"
-if [ -n "$PANE_TITLE" ] && [ -n "$PANE_ID" ]; then
-    # Strip non-ASCII (unicode status icons: braille spinners, sparkles) + leading whitespace
-    # Preserves ASCII punctuation like [impl] prefixes
-    CLEAN_NAME=$(printf '%s' "$PANE_TITLE" | LC_ALL=C sed 's/[^[:print:]]//g' | sed 's/^[[:space:]]*//')
-    if [ -n "$CLEAN_NAME" ]; then
-        $TMUX_BIN rename-window -t "$PANE_ID" "$CLEAN_NAME" 2>/dev/null || true
-    fi
-fi
+PANE_ID=$($TMUX_BIN display-message -p $DISPLAY_FLAG '#{pane_id}' 2>/dev/null || echo "")
 
-# Get pane target: session_name:window_name.pane_index (name is stable; index shifts on delete)
-# Read AFTER rename so window_name reflects the synced value
-# Use PANE_ID (from above) for -t to ensure we read OUR pane, not the focused one
+# Get pane target: session_name:window_name.pane_index
+# Window name sync is handled by tmux pane-title-changed hook (sync_window_name.sh)
 # shellcheck disable=SC2086
 PANE_TARGET=$($TMUX_BIN display-message -p -t "${PANE_ID:-$DISPLAY_TARGET}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
 if [ -z "$PANE_TARGET" ]; then
@@ -69,18 +58,10 @@ SAFE_NAME=$(echo "$PANE_TARGET" | tr ':.' '_')
 
 EVENT="${SWARM_EVENT:-SessionStart}"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-case "$EVENT" in
-    SessionStart|Stop)
-        STATUS="idle"
-        ;;
-    UserPromptSubmit)
-        STATUS="busy"
-        ;;
-    *)
-        STATUS="unknown"
-        ;;
-esac
+# Status is primarily read from pane_title (✳=idle, ⠂/⠐=busy) by swarm CLI.
+# Card status is a secondary record for offline/historical use only.
+STATUS="idle"
+[ "$EVENT" = "UserPromptSubmit" ] && STATUS="busy"
 
 # Resolve JSONL path for collect
 RESOLVED_CWD="$CWD"
@@ -113,8 +94,22 @@ fi
 # Heartbeat: always update timestamp on every hook fire
 NEW_FIELDS=$(echo "$NEW_FIELDS" | jq --arg ts "$TIMESTAMP" '. + {last_heartbeat: $ts}')
 
-# Merge-update: preserve existing fields (role, team, capabilities, current_task)
+# Clean up stale cards: if window was renamed, old card has same session_id but different filename.
+# Migrate metadata (role, team, capabilities, current_task) from old card before deleting it.
 CARD_FILE="$AGENTS_DIR/${SAFE_NAME}.json"
+MIGRATED_FIELDS=""
+for old_card in "$AGENTS_DIR"/*.json; do
+    [ -f "$old_card" ] || continue
+    [ "$old_card" = "$CARD_FILE" ] && continue
+    old_sid=$(jq -r '.session_id // empty' "$old_card" 2>/dev/null)
+    if [ "$old_sid" = "$SESSION_ID" ]; then
+        # Same session, different filename — stale card from before rename
+        MIGRATED_FIELDS=$(jq '{role, team, capabilities, current_task, last_task_id} | with_entries(select(.value != null))' "$old_card" 2>/dev/null || echo "")
+        rm -f "$old_card"
+    fi
+done
+
+# Merge-update: preserve existing fields (role, team, capabilities, current_task)
 if [ -f "$CARD_FILE" ]; then
     # Clear current_task when agent goes idle (task completed)
     if [ "$STATUS" = "idle" ]; then
