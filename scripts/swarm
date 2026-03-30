@@ -206,10 +206,17 @@ _refresh_stale_cards() {
         [ -z "$actual_pane" ] && continue  # pane gone or not in tmux
         [ "$actual_pane" = "$card_pane" ] && continue  # no change
 
+        # Guard: verify the new pane looks like a CC session (pid-reuse protection)
+        if ! is_cc_pane "$actual_pane" 2>/dev/null; then
+            continue  # pid was reused by a non-CC pane, skip
+        fi
+
         # Target changed — update card and rename file
         local new_safe new_file
         new_safe=$(echo "$actual_pane" | tr ':.' '_')
         new_file="$AGENTS_DIR/${new_safe}.json"
+        # Skip if destination card already exists (avoid collision/data loss)
+        [ -f "$new_file" ] && [ "$card" != "$new_file" ] && continue
         jq --arg p "$actual_pane" '.pane = $p' "$card" > "${card}.tmp" && mv "${card}.tmp" "$new_file"
         [ "$card" != "$new_file" ] && rm -f "$card"
     done
@@ -823,7 +830,7 @@ cmd_resume_all() {
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --cmd|-c) cc_cmd="$2"; shift 2 ;;
-            --delay) delay="$2"; shift 2 ;;
+            --delay) delay="$2"; require_int "--delay" "$delay"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -833,7 +840,7 @@ cmd_resume_all() {
         exit 1
     fi
 
-    local total=0 resumed=0 skipped_active=0 skipped_gone=0
+    local total=0 resumed=0 skipped_active=0 skipped_gone=0 skipped_invalid=0
 
     for card in "$AGENTS_DIR"/*.json; do
         [ -f "$card" ] || continue
@@ -846,7 +853,14 @@ cmd_resume_all() {
 
         if [ -z "$pane" ] || [ -z "$session_id" ]; then
             echo "  [SKIP] $(basename "$card" .json) — missing pane or session_id"
-            skipped_gone=$((skipped_gone + 1))
+            skipped_invalid=$((skipped_invalid + 1))
+            continue
+        fi
+
+        # Reject values containing single quotes (shell injection via send-keys)
+        if [[ "$cwd" == *"'"* ]] || [[ "$session_id" == *"'"* ]]; then
+            echo "  [SKIP] $pane — cwd or session_id contains unsafe characters"
+            skipped_invalid=$((skipped_invalid + 1))
             continue
         fi
 
@@ -870,7 +884,7 @@ cmd_resume_all() {
             continue
         fi
 
-        # Resume: cd to cwd first, then launch
+        # Resume: cd to cwd first, then launch (values validated above)
         echo "  [RESUME] $pane — session ${session_id:0:8}..."
         if [ -n "$cwd" ] && [ -d "$cwd" ]; then
             $TMUX_BIN send-keys -t "$pane" "cd '$cwd'" Enter
@@ -884,10 +898,16 @@ cmd_resume_all() {
     done
 
     echo ""
+    local skip_summary=""
+    [ "$skipped_active" -gt 0 ] && skip_summary="$skipped_active already active"
+    [ "$skipped_gone" -gt 0 ] && skip_summary="${skip_summary:+$skip_summary, }$skipped_gone panes gone"
+    [ "$skipped_invalid" -gt 0 ] && skip_summary="${skip_summary:+$skip_summary, }$skipped_invalid invalid cards"
+    [ -z "$skip_summary" ] && skip_summary="none skipped"
+
     if $dry_run; then
-        echo "Dry run: would resume $resumed/$total agents. $skipped_active already active, $skipped_gone panes gone."
+        echo "Dry run: would resume $resumed/$total agents. $skip_summary."
     else
-        echo "Resumed $resumed/$total agents. $skipped_active already active, $skipped_gone panes gone."
+        echo "Resumed $resumed/$total agents. $skip_summary."
     fi
 }
 
@@ -961,27 +981,37 @@ cmd_launch() {
         fi
 
         # Create new tmux window (-d = don't steal focus)
-        local target
+        # Capture pane_id (%N) for unambiguous targeting (window_name can be duplicated)
+        local pane_id target
         if [ -n "$start_window" ] && [ $i -eq 1 ]; then
-            target=$($TMUX_BIN new-window -d -t "${session}:${start_window}" -P -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null) \
-                || target="${session}:${start_window}.0"
+            pane_id=$($TMUX_BIN new-window -d -t "${session}:${start_window}" -P -F '#{pane_id}' 2>/dev/null) \
+                || pane_id=""
         else
-            target=$($TMUX_BIN new-window -d -t "${session}" -P -F '#{session_name}:#{window_name}.#{pane_index}')
+            pane_id=$($TMUX_BIN new-window -d -t "${session}" -P -F '#{pane_id}')
         fi
 
-        # Rename tmux window if name provided
+        # Use pane_id for all subsequent commands (unambiguous), but compute display target
+        if [ -n "$pane_id" ]; then
+            target=$($TMUX_BIN display-message -t "$pane_id" -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "$pane_id")
+        else
+            target="${session}:${start_window}.0"
+            pane_id="$target"
+        fi
+
+        # Rename tmux window if name provided (use pane_id for unambiguous targeting)
         if [ -n "$instance_name" ]; then
-            local win_target="${target%.*}"
-            $TMUX_BIN rename-window -t "$win_target" "$instance_name" 2>/dev/null || true
+            $TMUX_BIN rename-window -t "$pane_id" "$instance_name" 2>/dev/null || true
+            # Refresh display target after rename
+            target=$($TMUX_BIN display-message -t "$pane_id" -p '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "$target")
         fi
 
         echo "[$i/$count] Launching in $target${instance_name:+ (name: $instance_name)}..."
 
-        # Send the cc command to the new shell
-        $TMUX_BIN send-keys -t "$target" "$full_cmd" Enter
+        # Send the cc command to the new shell (pane_id for unambiguous targeting)
+        $TMUX_BIN send-keys -t "$pane_id" "$full_cmd" Enter
 
         # Wait for CC to be fully ready before launching next
-        if wait_cc_ready "$target" "$timeout"; then
+        if wait_cc_ready "$pane_id" "$timeout"; then
             echo ""
             echo "  CC ready in $target"
             launched=$((launched + 1))
@@ -989,7 +1019,7 @@ cmd_launch() {
             # Ensure CC session name is set via /rename (cc -n may not pass through)
             if [ -n "$instance_name" ]; then
                 sleep 1
-                $TMUX_BIN send-keys -t "$target" "/rename $instance_name" Enter
+                $TMUX_BIN send-keys -t "$pane_id" "/rename $instance_name" Enter
                 sleep 0.5
             fi
         else
@@ -1909,6 +1939,15 @@ cmd_review() {
 
 Read the artifact above and write your review to: \`${review_result_path}\`
 
+## Reviewer Authority
+
+You are a gatekeeper, not an advisor.
+- **ACCEPT**: all Critical and Important issues are resolved. Work is approved.
+- **REVISE**: Critical or Important issues remain. Author MUST address ALL before proceeding.
+- **REJECT**: fundamental problems. Author must rethink the approach.
+
+ACCEPT only when you would genuinely approve this work. Do not ACCEPT to be kind.
+
 ## Review Format
 
 Structure your review with these sections:
@@ -1930,6 +1969,17 @@ What works well — be specific.
 
 ### Summary
 2-3 sentence overall assessment.
+
+---
+
+**After writing your review**, notify the author:
+
+\`\`\`bash
+swarm send ${author} "Review ${review_task_id} complete. Verdict: <YOUR_VERDICT>. Read: ${review_result_path}"
+\`\`\`
+
+If verdict is REVISE or REJECT, the author MUST address all Critical and Important
+items before the work is considered complete. The review is a gate, not a suggestion.
 REVIEW_PROMPT
 
     # 8. Dispatch the review task (best-effort: task files are already created)

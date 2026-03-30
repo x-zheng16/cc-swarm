@@ -120,11 +120,11 @@ EOF
     create_agent_card "mbp:reviewer.0"
 
     "$SWARM_SCRIPT" review 20260328_draft --reviewer mbp:reviewer.0 \
-        --artifact /Users/x/projects/research/paper/main.tex
+        --artifact /tmp/test_project/paper/main.tex
 
     local prompt_file="$SWARM_DIR/tasks/20260328_draft_review_r1/prompt.md"
     run cat "$prompt_file"
-    [[ "$output" == *"/Users/x/projects/research/paper/main.tex"* ]]
+    [[ "$output" == *"/tmp/test_project/paper/main.tex"* ]]
 }
 
 # --- review: sets from/to correctly (author -> reviewer) ---

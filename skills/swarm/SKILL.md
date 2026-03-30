@@ -146,7 +146,7 @@ When reviewing, write your output to `result_path` with this structure:
 ```markdown
 # Review: {what you reviewed}
 
-## Verdict: MAJOR_REVISION | MINOR_REVISION | ACCEPT
+## Verdict: ACCEPT | REVISE | REJECT
 
 ## Critical Issues (must fix)
 1. ...
@@ -164,15 +164,39 @@ When reviewing, write your output to `result_path` with this structure:
 One paragraph assessment.
 ```
 
+### Review Authority
+
+**The reviewer is a gatekeeper, not an advisor.**
+Treat review verdicts like human review — the reviewer says yes or no.
+
+- **ACCEPT**: work is approved. Proceed to next task.
+- **REVISE**: you MUST address ALL Critical and Important items before proceeding. Do not cherry-pick. Do not self-dismiss findings.
+- **REJECT**: fundamental problems. Rethink the approach and re-submit.
+
+Rules for the author (you, when receiving a review):
+1. Read the ENTIRE review before acting.
+2. Address every Critical item. Address every Important item. Minor items are optional.
+3. Do NOT proceed to the next task until the reviewer approves (ACCEPT).
+4. If you disagree with a finding, explain why in a message to the reviewer — do not silently ignore it.
+5. After revisions, request re-review: `swarm review <task_id> --reviewer <same_agent>` (creates r2, r3...).
+
+Rules for the reviewer:
+1. Be specific — cite file paths, line numbers, concrete examples.
+2. Distinguish severity clearly (Critical vs Important vs Minor).
+3. ACCEPT only when all Critical and Important items are resolved.
+4. After the author revises, re-review the specific items you flagged.
+
 ### Review Flow
 
 ```
 Author finishes work
   -> swarm review <task_id> --reviewer <other_agent>
 Reviewer reads artifact, writes structured review
-  -> swarm send <author> "Review done, read result_path"
-Author reads review, revises
-  -> If needed: swarm review <task_id> --reviewer <other_agent>  (creates _r2)
+  -> swarm send <author> "Review done. Verdict: REVISE. Read: <result_path>"
+Author reads review, addresses ALL Critical + Important items
+  -> swarm review <task_id> --reviewer <same_agent>  (creates _r2)
+Reviewer re-reviews, checks flagged items
+  -> ACCEPT or another REVISE round
 ```
 
 ## Sprint Contracts

@@ -122,7 +122,7 @@ EOF
     [[ "$output" == *"1 panes gone"* ]]
 }
 
-@test "resume-all: sends correct resume command" {
+@test "resume-all: sends correct cd and resume commands" {
     create_card "mbp:my-agent.0" "uuid-resume-me" "/tmp/workdir"
     echo "mbp:my-agent.0" > "$MOCK_DIR/alive_panes"
     mkdir -p /tmp/workdir
@@ -131,6 +131,7 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"RESUME"* ]]
     [ -f "$MOCK_DIR/send_keys.log" ]
+    grep -q "cd.*/tmp/workdir" "$MOCK_DIR/send_keys.log"
     grep -q "resume.*uuid-resume-me" "$MOCK_DIR/send_keys.log"
 }
 
@@ -171,10 +172,39 @@ EOF
     run "$SWARM" resume-all --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"SKIP"* ]]
+    [[ "$output" == *"invalid cards"* ]]
 }
 
 @test "resume-all: no cards produces clean output" {
     run "$SWARM" resume-all --dry-run
     [ "$status" -eq 0 ]
     [[ "$output" == *"would resume 0/0"* ]]
+}
+
+@test "resume-all: rejects cwd containing single quotes" {
+    local safe="mbp_inject-agent_0"
+    cat > "$AGENTS_DIR/${safe}.json" << 'EOF'
+{"pane":"mbp:inject-agent.0","session_id":"uuid-inject","cwd":"/tmp/it's/here","pid":12345,"status":"idle"}
+EOF
+    echo "mbp:inject-agent.0" > "$MOCK_DIR/alive_panes"
+
+    run "$SWARM" resume-all --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SKIP"*"unsafe"* ]]
+}
+
+@test "resume-all: rejects session_id containing single quotes" {
+    local safe="mbp_inject2_0"
+    printf '%s\n' '{"pane":"mbp:inject2.0","session_id":"uuid'"'"'evil","cwd":"/tmp","pid":12345,"status":"idle"}' \
+        > "$AGENTS_DIR/${safe}.json"
+    echo "mbp:inject2.0" > "$MOCK_DIR/alive_panes"
+
+    run "$SWARM" resume-all --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SKIP"*"unsafe"* ]]
+}
+
+@test "resume-all: --delay rejects non-integer" {
+    run "$SWARM" resume-all --delay foo
+    [ "$status" -ne 0 ]
 }
