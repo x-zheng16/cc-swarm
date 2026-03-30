@@ -48,15 +48,28 @@ log_activity() {
     shift
     local ts
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local json
-    json=$(jq -c -n --arg action "$action" --arg ts "$ts" '{action: $action, timestamp: $ts}')
+    # Build all --arg pairs in one jq call (no per-field subprocess)
+    local -a jq_args=(--arg action "$action" --arg ts "$ts")
+    local jq_filter='{action: $action, timestamp: $ts'
+    local idx=0
     while [ $# -gt 0 ]; do
-        local key="${1%%=*}"
-        local val="${1#*=}"
-        json=$(echo "$json" | jq -c --arg k "$key" --arg v "$val" '. + {($k): $v}')
+        local kvar="k${idx}" vvar="v${idx}"
+        jq_args+=(--arg "$kvar" "${1%%=*}" --arg "$vvar" "${1#*=}")
+        jq_filter+=", (\$$kvar): \$$vvar"
+        idx=$((idx + 1))
         shift
     done
-    echo "$json" >> "$ACTIVITY_LOG"
+    jq_filter+='}'
+    jq -c -n "${jq_args[@]}" "$jq_filter" >> "$ACTIVITY_LOG"
+}
+
+# Validate that a value is a positive integer
+require_int() {
+    local name="$1" val="$2"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        echo "Error: $name must be a positive integer, got '$val'" >&2
+        exit 1
+    fi
 }
 
 # --- Utility functions ---
@@ -406,6 +419,7 @@ cmd_monitor() {
             --tail)
                 mode="tail"
                 lines="${2:-30}"
+                require_int "--tail" "$lines"
                 shift 2
                 ;;
             *)
@@ -586,7 +600,8 @@ cmd_status() {
 }
 
 cmd_register_all() {
-    set +e  # Don't abort on individual pane registration failures
+    (  # Subshell: set +e scoped, auto-restores on exit
+    set +e
     echo "Registering CC sessions by correlating tmux panes with session files..."
     local count=0
 
@@ -697,7 +712,7 @@ cmd_register_all() {
 
     echo ""
     echo "Registered $count sessions."
-    set -e  # Restore
+    )  # End subshell — set -e automatically restored
 }
 
 cmd_launch() {
@@ -715,8 +730,8 @@ cmd_launch() {
         case "$1" in
             --session|-s)   session="$2";       shift 2 ;;
             --cmd|-c)       cc_cmd="$2";        shift 2 ;;
-            --timeout|-t)   timeout="$2";       shift 2 ;;
-            --count)        count="$2";         shift 2 ;;
+            --timeout|-t)   timeout="$2"; require_int "--timeout" "$timeout"; shift 2 ;;
+            --count)        count="$2"; require_int "--count" "$count"; shift 2 ;;
             --window|-w)    start_window="$2";  shift 2 ;;
             --name|-n)      agent_name="$2";    shift 2 ;;
             --model|-m)     model="$2";         shift 2 ;;
@@ -758,14 +773,14 @@ cmd_launch() {
             else
                 instance_name="$agent_name"
             fi
-            full_cmd="$full_cmd -n '$instance_name'"
+            full_cmd="$full_cmd -n \"$instance_name\""
         fi
         if [ -n "$model" ]; then
             full_cmd="$full_cmd --model $model"
         fi
         if [ ${#extra_args[@]} -gt 0 ]; then
             for arg in "${extra_args[@]}"; do
-                full_cmd="$full_cmd '$arg'"
+                full_cmd="$full_cmd \"$arg\""
             done
         fi
 
@@ -1447,14 +1462,12 @@ cmd_dispatch_v2() {
 
     # 7. Append completion notification instruction to prompt.md (skip if already present)
     if ! grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
-        local env_result_path
-        env_result_path=$(jq -r '.result_path // empty' "$task_dir/envelope.json")
         cat >> "$task_dir/prompt.md" <<NOTIFY
 
 ---
 **When you finish this task**, notify the dispatcher:
 \`\`\`bash
-swarm send $env_from "done: $task_id result: ${env_result_path:-$TASKS_DIR/$task_id/result.md}"
+swarm send $env_from "done: $task_id"
 \`\`\`
 NOTIFY
     fi
@@ -1947,7 +1960,7 @@ cmd_heartbeat() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --timeout) timeout="$2"; shift 2 ;;
+            --timeout) timeout="$2"; require_int "--timeout" "$timeout"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -2078,7 +2091,7 @@ cmd_log() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            --last) last="$2"; shift 2 ;;
+            --last) last="$2"; require_int "--last" "$last"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -2587,6 +2600,7 @@ Commands:
   check-drain --target <pane>        Check if agent is draining
   log [--last N]                      Show activity log (default: last 50)
   merge --base B [--sources S1,S2]  Merge worktree branches (conflict-safe)
+  register-all                      Force-register all CC sessions
   run <dag.json> [options]          Execute a DAG workflow
 
 Launch options:
