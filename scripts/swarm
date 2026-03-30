@@ -1447,12 +1447,14 @@ cmd_dispatch_v2() {
 
     # 7. Append completion notification instruction to prompt.md (skip if already present)
     if ! grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
+        local env_result_path
+        env_result_path=$(jq -r '.result_path // empty' "$task_dir/envelope.json")
         cat >> "$task_dir/prompt.md" <<NOTIFY
 
 ---
 **When you finish this task**, notify the dispatcher:
 \`\`\`bash
-swarm send $env_from "done: $task_id"
+swarm send $env_from "done: $task_id result: ${env_result_path:-$TASKS_DIR/$task_id/result.md}"
 \`\`\`
 NOTIFY
     fi
@@ -2402,14 +2404,16 @@ case "${1:-}" in
         cmd_team "$@"
         ;;
     topology)
-        cmd_topology
+        shift
+        cmd_topology "$@"
         ;;
     review)
         shift
         cmd_review "$@"
         ;;
     list|ls)
-        cmd_list
+        shift
+        cmd_list "$@"
         ;;
     dispatch|d)
         shift
@@ -2441,7 +2445,8 @@ case "${1:-}" in
         cmd_collect "$@"
         ;;
     status|s)
-        cmd_status
+        shift
+        cmd_status "$@"
         ;;
     send)
         shift
