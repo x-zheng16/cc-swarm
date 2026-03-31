@@ -918,6 +918,7 @@ cmd_launch() {
     local timeout=180
     local count=1
     local start_window=""
+    local after_window=""
     local agent_name=""
     local model=""
     local extra_args=()
@@ -930,6 +931,7 @@ cmd_launch() {
             --timeout|-t)   timeout="$2"; require_int "--timeout" "$timeout"; shift 2 ;;
             --count)        count="$2"; require_int "--count" "$count"; shift 2 ;;
             --window|-w)    start_window="$2";  shift 2 ;;
+            --after|-a)     after_window="$2";  shift 2 ;;
             --name|-n)      agent_name="$2";    shift 2 ;;
             --model|-m)     model="$2";         shift 2 ;;
             --)             shift; extra_args+=("$@"); break ;;
@@ -945,7 +947,7 @@ cmd_launch() {
 
     if [ -z "$session" ]; then
         echo "Error: session name required" >&2
-        echo "Usage: swarm launch <session> [--count N] [--name NAME] [--model MODEL] [--cmd cc|cc2] [--window W] [--timeout S] [-- extra-claude-args...]" >&2
+        echo "Usage: swarm launch <session> [--count N] [--name NAME] [--model MODEL] [--cmd cc|cc2] [--window W] [--after W] [--timeout S] [-- extra-claude-args...]" >&2
         exit 1
     fi
 
@@ -984,7 +986,15 @@ cmd_launch() {
         # Create new tmux window (-d = don't steal focus)
         # Capture pane_id (%N) for unambiguous targeting (window_name can be duplicated)
         local pane_id target
-        if [ -n "$start_window" ] && [ $i -eq 1 ]; then
+        if [ -n "$after_window" ]; then
+            # Insert after specified window (-a = after target)
+            pane_id=$($TMUX_BIN new-window -d -a -t "${session}:${after_window}" -P -F '#{pane_id}' 2>/dev/null) \
+                || pane_id=""
+            # Subsequent windows in a batch insert after the one just created
+            if [ -n "$pane_id" ]; then
+                after_window=$($TMUX_BIN display-message -t "$pane_id" -p '#{window_name}' 2>/dev/null)
+            fi
+        elif [ -n "$start_window" ] && [ $i -eq 1 ]; then
             pane_id=$($TMUX_BIN new-window -d -t "${session}:${start_window}" -P -F '#{pane_id}' 2>/dev/null) \
                 || pane_id=""
         else
@@ -2990,6 +3000,7 @@ Launch options:
   --count N                         Number of sessions to launch (default: 1)
   --cmd cc|cc2, -c cc|cc2           CC command to use (default: cc)
   --window W, -w W                  Window index for first launch
+  --after W, -a W                   Insert new window after specified window name
   --timeout S, -t S                 Max seconds to wait per session (default: 180)
   -- [args...]                      Extra args passed through to claude CLI
 
