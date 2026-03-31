@@ -5,50 +5,111 @@
 <h1 align="center">CC Swarm</h1>
 
 <p align="center">
-  Multi-agent coordination for <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> over tmux
+  Peer-mesh multi-agent coordination for <a href="https://github.com/anthropics/claude-code">Claude Code</a> over tmux
 </p>
 
 <p align="center">
-  <b>Peer mesh</b> &middot; Pure bash &middot; Zero dependencies beyond tmux + jq<br>
-  ~3200 lines &middot; 151 tests &middot; Claude Code plugin
+  Pure bash &middot; Zero dependencies beyond tmux + jq &middot; Claude Code plugin<br>
+  ~3,200 lines &middot; 190 tests &middot; 40+ CLI commands
 </p>
 
 ---
 
-## The Problem
+## Why CC Swarm?
 
-Claude Code's built-in Agent Teams splits the terminal into panes.
-At 5+ agents, each pane is unreadably small.
-At 10+, it's unusable.
+Claude Code's built-in [Agent Teams](https://docs.anthropic.com/en/docs/claude-code/agent-teams) spawns teammates as subprocesses.
+At 5+ agents, visibility degrades.
+At 10+, debugging becomes guesswork.
 
-CC Swarm gives every agent a full tmux window.
-Dispatch tasks, exchange reviews, merge branches, monitor liveness -- all via a single CLI.
+CC Swarm takes a different approach: **every agent is an independent Claude Code session in its own tmux window**.
+Full context window per agent.
+Full scrollback.
+Full autonomy.
+
+Dispatch tasks, exchange binding reviews, merge branches, monitor liveness -- all through a single CLI that reads and writes plain JSON files.
 Scale to as many agents as your machine (and API quota) can handle.
+
+## Comparison
+
+The Claude Code multi-agent ecosystem is growing fast.
+Here is where CC Swarm fits relative to the major alternatives.
+
+| | **CC Swarm** | **[OMC](https://github.com/Yeachan-Heo/oh-my-claudecode)** | **[Claude Squad](https://github.com/smtg-ai/claude-squad)** | **[Gas Town](https://github.com/steveyegge/gastown)** | **[Overstory](https://github.com/jayminwest/overstory)** | **Agent Teams** (built-in) |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Stars** | 1 | 17.7k | 6.7k | 13.3k | 1.1k | -- (built-in) |
+| **Language** | Bash | TypeScript | Go | Go | TypeScript | TypeScript |
+| **LOC** | ~3,200 | ~182k TS | ~6k | ~12k+ | ~8k | -- (part of CC) |
+| **Architecture** | Peer mesh | Hub-spoke | Session manager | Worktree manager | Worktree orchestrator | File-based teams |
+| **Agent isolation** | tmux windows | tmux panes / worktrees | tmux sessions + worktrees | tmux + worktrees | tmux + worktrees | Subprocesses |
+| **Communication** | Mailbox + structured tasks | File-based JSONL mailbox | None (manual) | Shared planning files | SQLite mail | File append/read |
+| **Review protocol** | Binding verdicts (ACCEPT/REVISE/REJECT), auto-incrementing rounds | Agent role (no gate) | None | None | None | None |
+| **Task lifecycle** | Create, dispatch, track, update, collect | Pipeline stages | None (session-level) | None (session-level) | Task queue | Shared task list |
+| **Merge coordinator** | `git merge-tree` conflict detection + sequential merge | `git merge-tree` + `--no-ff` | None | Manual | Tiered conflict resolution | None |
+| **DAG workflows** | JSON dependency graph + scheduler | Pipeline stages | None | None | None | Dependency tracking |
+| **Monitor agent** | Dedicated watchdog (stuck detection, auto-nudge, escalation) | HUD status bar | Status display | TUI status | None | None |
+| **Drain / graceful shutdown** | Yes | Yes (`omc wait`) | None | None | None | None |
+| **Multi-runtime** | Claude Code only | Claude + Codex + Gemini | Claude + Codex + OpenCode + Amp | Claude Code only | 11 runtimes | Claude Code only |
+| **Dependencies** | bash, tmux, jq | Node.js 20+, tmux | Go binary | Go binary | Node.js, tmux | None (built-in) |
+| **Install** | `git clone` + symlink | `npm i -g` | Binary download | Binary download | `npm i -g` | Enable in settings |
+
+### Design trade-offs
+
+**CC Swarm** optimizes for **transparency and debuggability**.
+Every piece of state is a JSON file you can `cat`.
+Every command is a bash function you can read.
+The trade-off is no GUI, no TUI, and Claude-only.
+
+**OMC** optimizes for **zero-config productivity**.
+Team plan, PRD generation, smart model routing (Haiku/Sonnet/Opus tiers) that saves 30-50% on tokens.
+The trade-off is 182k lines of TypeScript and a hub-spoke architecture where workers cannot talk to each other directly.
+
+**Claude Squad** and **Gas Town** optimize for **session management**.
+Launch many agents, monitor their status, switch between them.
+They don't provide inter-agent communication, task tracking, or review protocols -- you manage coordination manually.
+
+**Overstory** optimizes for **runtime-agnosticism**.
+Its adapter pattern supports 11 different AI CLIs.
+The trade-off is less depth in any single runtime's features.
+
+**Agent Teams** (built-in) optimizes for **zero-install simplicity**.
+Teammates share a filesystem-based protocol at `~/.claude/`.
+The trade-off is experimental status, limited visibility into agent state, and no review gate.
+
+### What CC Swarm does differently
+
+1. **Peer mesh, not hub-spoke.** Any agent can dispatch to any other. No central coordinator bottleneck.
+2. **Binding review protocol.** ACCEPT/REVISE/REJECT verdicts with auto-incrementing rounds. Reviews are gates, not suggestions.
+3. **Full context per agent.** Each agent is an independent CC session with its own 200k-token context window, not a subagent with a fraction of the parent's context.
+4. **Deterministic status detection.** Process tree + plugin hooks = no screen scraping, no TUI heuristics.
+5. **Minimal footprint.** ~3,200 lines of bash. No npm, no Docker, no runtime. Dependencies: bash, tmux, jq.
 
 ## Features
 
-| Category            | What you get                                                                     |
-| ------------------- | -------------------------------------------------------------------------------- |
-| **Task lifecycle**  | Create, dispatch, track, collect -- structured V2 protocol with envelopes        |
-| **Review exchange** | Cross-agent code review with auto-incrementing rounds (r1, r2, r3...)            |
-| **Teams**           | Roles (worker/lead/monitor), teams, topology, capabilities                       |
-| **Messaging**       | Async mailbox with push notification via tmux paste                              |
-| **QA protocol**     | Tracked question-answer exchanges between agents                                 |
-| **Heartbeat**       | Hook-driven liveness detection, stale agent alerts                               |
-| **Drain signal**    | Graceful shutdown -- agent finishes current task, then stops                      |
-| **Dispatch dedup**  | Prevents accidental double-dispatch (`--force` to override)                      |
-| **File locking**    | Atomic mkdir-based locks with PID stale detection                                |
-| **Activity log**    | Unified JSONL event stream for audit and debugging                               |
-| **Merge coord**     | Non-destructive conflict detection via `git merge-tree`, sequential safe merge    |
-| **DAG workflows**   | Declare task dependencies in JSON, let swarm schedule execution                   |
-| **Monitor agent**   | Dedicated watchdog that detects stuck/idle agents and intervenes                  |
-| **Session launch**  | Sequential launch with readiness detection and auto-registration                 |
+| Category           | What you get                                                                    |
+| ------------------ | ------------------------------------------------------------------------------- |
+| **Task lifecycle** | Create, dispatch, track, update, collect -- structured protocol with envelopes  |
+| **Review exchange** | Cross-agent code review with binding verdicts and auto-incrementing rounds     |
+| **Teams**          | Roles (worker/lead/monitor), teams, topology, capabilities                      |
+| **Messaging**      | Async mailbox with push notification via tmux                                   |
+| **QA protocol**    | Tracked question-answer exchanges between agents                                |
+| **Heartbeat**      | Hook-driven liveness detection, stale agent alerts                              |
+| **Drain signal**   | Graceful shutdown -- agent finishes current task, then stops                     |
+| **Dispatch dedup** | Prevents accidental double-dispatch (`--force` to override)                     |
+| **File locking**   | Atomic mkdir-based locks with PID stale detection                               |
+| **Activity log**   | Unified JSONL event stream for audit and debugging                              |
+| **Merge coord**    | Non-destructive conflict detection via `git merge-tree`, sequential safe merge   |
+| **DAG workflows**  | Declare task dependencies in JSON, let swarm schedule execution                  |
+| **Monitor agent**  | Dedicated watchdog that detects stuck/idle agents and intervenes                 |
+| **Session launch** | Sequential launch with readiness detection and auto-registration                |
+| **Resume-all**     | Batch resume CC sessions from agent cards after restart                          |
+| **Triage**         | Parse review results into Linear tickets with severity mapping                  |
+| **Atomic rename**  | Update CC session + pane title + window name + agent card in one command         |
 
 ## Quick Start
 
 ### Prerequisites
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
+- [Claude Code](https://github.com/anthropics/claude-code) CLI
 - [tmux](https://github.com/tmux/tmux)
 - [jq](https://jqlang.github.io/jq/)
 - Python 3.11+ with [uv](https://github.com/astral-sh/uv) (for DAG workflows only)
@@ -107,7 +168,7 @@ tmux session "dev"
                          |
                    ~/.claude-swarm/
                    |-- agents/          # JSON card per agent (status, role, heartbeat)
-                   |-- tasks/           # V2 task dirs (envelope + prompt + result)
+                   |-- tasks/           # Task dirs (envelope + prompt + result)
                    |-- mailbox/         # Per-agent async inboxes
                    |-- qa/              # Tracked QA exchanges
                    |-- drain/           # Drain signal files
@@ -138,7 +199,7 @@ Process tree + hooks = deterministic status.
 
 ## Usage
 
-### V2 Dispatch (Structured)
+### Structured Dispatch
 
 The full-featured way to delegate work with tracking:
 
@@ -158,7 +219,7 @@ swarm monitor dev:worker1.0 --wait 600
 cat ~/.claude-swarm/tasks/20260330_auth_refactor/result.md
 ```
 
-### V1 Dispatch (Quick)
+### Quick Dispatch
 
 For simple, untracked tasks:
 
@@ -178,6 +239,9 @@ swarm review 20260330_auth_refactor --reviewer dev:worker2.0
 # Creates 20260330_auth_refactor_review_r1 and dispatches
 # If r1 exists, auto-creates r2, r3, etc.
 ```
+
+Reviews produce structured verdicts: **ACCEPT** (proceed), **REVISE** (must fix all Critical + Important items), or **REJECT** (rethink approach).
+The reviewer is a gatekeeper -- verdicts are binding.
 
 ### Fan-Out / Fan-In
 
@@ -280,77 +344,81 @@ swarm topology
 
 ### Core
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
-| `swarm list [-v]`                          | Show registered agents (`-v` adds session ID)       |
-| `swarm status`                             | Dashboard of all agents                             |
-| `swarm launch <session> [--count N]`       | Launch CC sessions sequentially in tmux             |
-| `swarm register-all`                       | Bulk-register existing CC sessions                  |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
+| `swarm list [-v]`                        | Show registered agents (`-v` adds session ID)     |
+| `swarm status`                           | Dashboard of all agents                           |
+| `swarm launch <session> [--count N]`     | Launch CC sessions sequentially in tmux           |
+| `swarm register-all`                     | Bulk-register existing CC sessions                |
+| `swarm resume-all [--dry-run]`           | Batch resume CC sessions from agent cards         |
+| `swarm rename <name> [--target <pane>]`  | Atomic rename (CC + pane title + window + card)   |
 
 ### Task Lifecycle
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
-| `swarm task create --id X --from P --to P` | Create a structured task with envelope               |
-| `swarm task status <id>`                   | Show task state                                     |
-| `swarm task list [--state S]`              | List tasks, optionally filtered                     |
-| `swarm dispatch --task <id> [--force]`     | V2 dispatch (target from envelope, dedup-protected) |
-| `swarm dispatch <target> "prompt"`         | V1 dispatch (simple, no tracking)                   |
-| `swarm dispatch <target> --file <path>`    | V1 dispatch from file                               |
-| `swarm monitor <target> --wait <seconds>`  | Block until target finishes                         |
-| `swarm collect <target>`                   | Get last assistant response text                    |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
+| `swarm task create --id X --from P --to P` | Create a structured task with envelope          |
+| `swarm task status <id>`                 | Show task state                                   |
+| `swarm task update <id> --state <S>`     | Update task state (appends transition)            |
+| `swarm task list [--state S]`            | List tasks, optionally filtered                   |
+| `swarm dispatch --task <id> [--force]`   | Structured dispatch (target from envelope)        |
+| `swarm dispatch <target> "prompt"`       | Quick dispatch (simple, no tracking)              |
+| `swarm dispatch <target> --file <path>`  | Quick dispatch from file                          |
+| `swarm monitor <target> --wait <seconds>` | Block until target finishes                      |
+| `swarm collect <target>`                 | Get last assistant response text                  |
 
 ### Review
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
 | `swarm review <task_id> --reviewer <pane>` | Request cross-agent review (auto-increments rounds) |
+| `swarm triage <task_id> [--dry-run]`     | Parse review into Linear tickets                  |
 
 ### Communication
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
-| `swarm send <target> "msg"`               | Async message to inbox (with tmux push)             |
-| `swarm inbox [--peek]`                     | Read your inbox (`--peek` = don't clear)            |
-| `swarm ask <target> "question"`            | Send tracked QA question                            |
-| `swarm reply <qa_id> "answer"`             | Reply to a QA question                              |
-| `swarm qa [--state S]`                     | List QA records                                     |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
+| `swarm send <target> "msg"`             | Async message to inbox (with tmux push)           |
+| `swarm inbox [--peek]`                   | Read your inbox (`--peek` = don't clear)          |
+| `swarm ask <target> "question"`          | Send tracked QA question                          |
+| `swarm reply <qa_id> "answer"`           | Reply to a QA question                            |
+| `swarm qa [--state S]`                   | List QA records                                   |
 
 ### Agent Management
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
-| `swarm card [<target>]`                    | Show agent card                                     |
-| `swarm card set-role <target> <role>`      | Set role (worker, lead, monitor)                    |
-| `swarm card set-team <target> <team>`      | Assign to team                                      |
-| `swarm card set-caps <target> <c1,c2>`     | Set capabilities                                    |
-| `swarm heartbeat [--timeout N]`            | Show agent liveness (default: 60s)                  |
-| `swarm drain <target>`                     | Signal: stop after current task                     |
-| `swarm cancel-drain <target>`              | Cancel a drain signal                               |
-| `swarm check-drain --target <pane>`        | Check if agent is draining                          |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
+| `swarm card [<target>]`                  | Show agent card                                   |
+| `swarm card set-role <target> <role>`    | Set role (worker, lead, monitor)                  |
+| `swarm card set-team <target> <team>`    | Assign to team                                    |
+| `swarm card set-caps <target> <c1,c2>`   | Set capabilities                                  |
+| `swarm heartbeat [--timeout N]`          | Show agent liveness (default: 60s)                |
+| `swarm drain <target>`                   | Signal: stop after current task                   |
+| `swarm cancel-drain <target>`            | Cancel a drain signal                             |
+| `swarm check-drain --target <pane>`      | Check if agent is draining                        |
 
 ### Teams
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
-| `swarm team create <name> --lead <pane>`   | Create a team                                       |
-| `swarm team add <name> <p1> [p2 ...]`      | Add members                                         |
-| `swarm team remove <name> <pane>`          | Remove member                                       |
-| `swarm team show <name>`                   | Show team details                                   |
-| `swarm team list`                          | List all teams                                      |
-| `swarm team delete <name>`                 | Delete a team                                       |
-| `swarm topology`                           | Show full topology                                  |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
+| `swarm team create <name> --lead <pane>` | Create a team                                     |
+| `swarm team add <name> <p1> [p2 ...]`   | Add members                                       |
+| `swarm team remove <name> <pane>`        | Remove member                                     |
+| `swarm team show <name>`                 | Show team details                                 |
+| `swarm team list`                        | List all teams                                    |
+| `swarm team delete <name>`               | Delete a team                                     |
+| `swarm topology`                         | Show full topology                                |
 
 ### Operations
 
-| Command                                    | Description                                         |
-| ------------------------------------------ | --------------------------------------------------- |
-| `swarm log [--last N]`                     | Show activity log (default: last 50)                |
-| `swarm merge --base B [--sources S1,S2]`   | Merge worktree branches (conflict-safe)             |
-| `swarm merge --base B --dry-run`           | Check for conflicts without merging                 |
-| `swarm monitor-start [--session S]`        | Launch the monitor agent                            |
-| `swarm monitor-status`                     | Show monitor report                                 |
-| `swarm run <dag.json> [--dry-run]`         | Execute a DAG workflow                              |
+| Command                                  | Description                                       |
+| ---------------------------------------- | ------------------------------------------------- |
+| `swarm log [--last N]`                   | Show activity log (default: last 50)              |
+| `swarm merge --base B [--sources S1,S2]` | Merge worktree branches (conflict-safe)           |
+| `swarm merge --base B --dry-run`         | Check for conflicts without merging               |
+| `swarm monitor-start [--session S]`      | Launch the monitor agent                          |
+| `swarm monitor-status`                   | Show monitor report                               |
+| `swarm run <dag.json> [--dry-run]`       | Execute a DAG workflow                            |
 
 ## Plugin Structure
 
@@ -359,28 +427,31 @@ cc-swarm/
 |-- .claude-plugin/
 |   +-- plugin.json              # Plugin manifest
 |-- scripts/
-|   |-- swarm                    # Main CLI (2631 lines, bash)
+|   |-- swarm                    # Main CLI (~3,000 lines, bash)
 |   |-- swarm_lock.sh            # Shared lock library (52 lines)
 |   +-- swarm_dag.py             # DAG workflow engine (531 lines)
 |-- hooks/
 |   |-- hooks.json               # SessionStart, UserPromptSubmit, Stop
-|   +-- register-agent.sh        # Auto-registration + heartbeat (115 lines)
+|   +-- register-agent.sh        # Auto-registration + heartbeat (130 lines)
 |-- skills/
 |   +-- swarm/
-|       +-- SKILL.md             # Teaches Claude the swarm protocol (353 lines)
+|       +-- SKILL.md             # Teaches Claude the swarm protocol (384 lines)
 |-- agents/
 |   +-- monitor.md               # Monitor agent prompt template
 |-- tests/
-|   |-- test_merge.bats          # Merge coordinator
-|   |-- test_phase1.bats         # Agent cards, task lifecycle
-|   |-- test_phase2.bats         # V2 dispatch, dedup
-|   |-- test_phase3.bats         # Team CRUD, topology
-|   |-- test_phase4.bats         # Review exchange protocol
-|   |-- test_phase5.bats         # Monitor agent template + commands
-|   |-- test_phase6.bats         # Mailbox, QA protocol
-|   |-- test_phase7.bats         # Heartbeat, dedup, drain signal
-|   |-- test_phase8.bats         # File locking, activity log
-|   +-- test_structure.bats      # Repo structure validation
+|   |-- test_merge.bats          # Merge coordinator (10 tests)
+|   |-- test_phase1.bats         # Agent cards, task lifecycle (22 tests)
+|   |-- test_phase2.bats         # Dispatch, dedup (11 tests)
+|   |-- test_phase3.bats         # Team CRUD, topology (20 tests)
+|   |-- test_phase4.bats         # Review exchange protocol (13 tests)
+|   |-- test_phase5.bats         # Monitor agent template + commands (12 tests)
+|   |-- test_phase6.bats         # Mailbox, QA protocol (15 tests)
+|   |-- test_phase7.bats         # Heartbeat, dedup, drain signal (9 tests)
+|   |-- test_phase8.bats         # File locking, activity log (8 tests)
+|   |-- test_resume_all.bats     # Resume-all (11 tests)
+|   |-- test_structure.bats      # Repo structure validation (16 tests)
+|   |-- test_task_update.bats    # Task state update (11 tests)
+|   +-- test_triage.bats         # Triage command (10 tests)
 +-- docs/
     +-- logo.png
 ```
@@ -388,7 +459,7 @@ cc-swarm/
 ## Testing
 
 ```bash
-bats tests/                      # Full suite: 151 tests
+bats tests/                      # Full suite: 190 tests
 bats tests/test_merge.bats       # Run specific test file
 ```
 
@@ -417,7 +488,7 @@ Targets are tmux pane addresses (`session:window.pane`).
 Results go to `result.md`.
 No config files.
 
-**~3200 lines of bash.**
+**~3,200 lines of bash.**
 No npm.
 No TypeScript runtime.
 No Docker.
