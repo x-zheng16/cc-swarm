@@ -116,7 +116,7 @@ The trade-off is experimental status, limited visibility into agent state, and n
 | **Task lifecycle** | Create, dispatch, track, update, collect -- structured protocol with envelopes  |
 | **Review exchange** | Cross-agent code review with binding verdicts and auto-incrementing rounds     |
 | **Teams**          | Roles (worker/lead/monitor), teams, topology, capabilities                      |
-| **Messaging**      | Async mailbox with push notification via tmux                                   |
+| **Messaging**      | Async mailbox, push notification, and broadcast to all idle agents              |
 | **QA protocol**    | Tracked question-answer exchanges between agents                                |
 | **Heartbeat**      | Hook-driven liveness detection, stale agent alerts                              |
 | **Drain signal**   | Graceful shutdown -- agent finishes current task, then stops                     |
@@ -292,6 +292,7 @@ C=$(swarm collect dev:worker3.0)
 ```bash
 # Async mailbox (with tmux push notification)
 swarm send dev:worker1.0 "Results ready at /tmp/analysis.json"
+swarm broadcast "New feature shipped: swarm task update. Reload skill."
 swarm inbox              # read and clear
 swarm inbox --peek       # read without clearing
 
@@ -374,7 +375,7 @@ swarm topology
 | ---------------------------------------- | ------------------------------------------------- |
 | `swarm list [-v]`                        | Show registered agents (`-v` adds session ID)     |
 | `swarm status`                           | Dashboard of all agents                           |
-| `swarm launch <session> [--count N]`     | Launch CC sessions sequentially in tmux           |
+| `swarm launch <session> [--count N] [--after W]` | Launch CC sessions (`--after` inserts adjacent) |
 | `swarm register-all`                     | Bulk-register existing CC sessions                |
 | `swarm resume-all [--dry-run]`           | Batch resume CC sessions from agent cards         |
 | `swarm rename <name> [--target <pane>]`  | Atomic rename (CC + pane title + window + card)   |
@@ -405,6 +406,7 @@ swarm topology
 | Command                                  | Description                                       |
 | ---------------------------------------- | ------------------------------------------------- |
 | `swarm send <target> "msg"`             | Async message to inbox (with tmux push)           |
+| `swarm broadcast "msg"`                 | Send message to all idle agents                   |
 | `swarm inbox [--peek]`                   | Read your inbox (`--peek` = don't clear)          |
 | `swarm ask <target> "question"`          | Send tracked QA question                          |
 | `swarm reply <qa_id> "answer"`           | Reply to a QA question                            |
