@@ -52,6 +52,32 @@ Here is where CC Swarm fits relative to the major alternatives.
 | **Dependencies** | bash, tmux, jq | Node.js 20+, tmux | Go binary | Go binary | Node.js, tmux | None (built-in) |
 | **Install** | `git clone` + symlink | `npm i -g` | Binary download | Binary download | `npm i -g` | Enable in settings |
 
+### Broader ecosystem
+
+Beyond Claude Code-specific tools, CC Swarm's design draws from and contrasts with general multi-agent orchestration:
+
+| | **CC Swarm** | **[ClawTeam](https://github.com/HKUDS/ClawTeam)** (HKUDS) | **[Google A2A](https://github.com/a2aproject/A2A)** | **[AI Scientist v2](https://github.com/SakanaAI/AI-Scientist-v2)** |
+| --- | --- | --- | --- | --- |
+| **Stars** | 1 | 4.1k | 22.9k | 4.1k |
+| **Type** | CLI tool | Python framework | Protocol spec | Research system |
+| **Language** | Bash (~3.2k LOC) | Python (~21k LOC) | Spec + SDKs | Python (~13k LOC) |
+| **Architecture** | Peer mesh, filesystem | Swarm, ZeroMQ + file transport | JSON-RPC / gRPC | Tree search + manager |
+| **Agent backends** | Claude Code | Claude Code, Codex, Cursor, nanobot, any CLI | Any (protocol-level) | Anthropic, OpenAI (API) |
+| **Communication** | Mailbox + tasks | Mailbox + routing policies | Message + Task protocol | Shared journal tree |
+| **Coordination** | File locks + hooks | Task store + locking | Agent Cards + Tasks | Manager agent + BFTS |
+| **Domain** | General dev | General dev | Cross-framework interop | ML research |
+| **Dashboard** | CLI only | Web dashboard | N/A | N/A |
+
+**ClawTeam** (HKU Data Science Lab) is the closest architectural peer -- it has mailbox routing, task management with locking, and multi-backend support.
+The key difference is scope: ClawTeam is a Python framework (~21k LOC) with ZeroMQ transport and a web dashboard; CC Swarm is a bash CLI (~3.2k LOC) that uses the filesystem as its only transport.
+
+**Google A2A** is a protocol specification, not an implementation.
+It defines how opaque agents discover each other (Agent Cards) and exchange tasks (JSON-RPC).
+CC Swarm's envelope-based task protocol (envelope.json + prompt.md + status.json) is conceptually similar to A2A's Task model, though CC Swarm's is filesystem-native rather than network-native.
+
+**AI Scientist v2** (Sakana AI) is domain-specific (ML research automation) rather than general multi-agent coordination.
+Its progressive agentic tree search (BFTS) is a different paradigm from CC Swarm's dispatch-and-collect model.
+
 ### Design trade-offs
 
 **CC Swarm** optimizes for **transparency and debuggability**.
