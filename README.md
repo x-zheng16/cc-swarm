@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.png" width="200" alt="CC Swarm">
+  <img src="docs/banner.png" alt="CC Swarm">
 </p>
 
 <h1 align="center">CC Swarm</h1>
