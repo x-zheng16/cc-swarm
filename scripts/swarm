@@ -1084,6 +1084,52 @@ cmd_send() {
     echo "Message sent to $target (from $sender)"
 }
 
+cmd_broadcast() {
+    local message="$*"
+    if [ -z "$message" ]; then
+        echo "Usage: swarm broadcast <message>" >&2
+        exit 1
+    fi
+
+    # Get sender identity to skip self
+    local my_pane="unknown"
+    if [ -n "${TMUX:-}" ]; then
+        my_pane=$($TMUX_BIN display-message -p -t "${TMUX_PANE:-}" '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "unknown")
+    fi
+
+    local sent=0 skipped_busy=0 skipped_self=0
+    for card in "$AGENTS_DIR"/*.json; do
+        [ -f "$card" ] || continue
+
+        local pane status
+        pane=$(jq -r '.pane' "$card")
+        status=$(jq -r '.status // "unknown"' "$card")
+
+        # Skip self
+        if [ "$pane" = "$my_pane" ]; then
+            skipped_self=$((skipped_self + 1))
+            continue
+        fi
+
+        # Skip busy agents
+        if [ "$status" = "busy" ]; then
+            skipped_busy=$((skipped_busy + 1))
+            continue
+        fi
+
+        # Skip if pane is gone
+        if ! $TMUX_BIN display-message -t "$pane" -p '#{pane_id}' >/dev/null 2>&1; then
+            continue
+        fi
+
+        cmd_send "$pane" "$message"
+        sent=$((sent + 1))
+    done
+
+    log_activity "broadcast" "sent=$sent" "skipped_busy=$skipped_busy"
+    echo "Broadcast: sent to $sent agents ($skipped_busy busy, skipped)"
+}
+
 cmd_inbox() {
     # Determine current agent's pane target
     local my_pane="unknown"
@@ -2844,6 +2890,14 @@ case "${1:-}" in
         fi
         cmd_send "$@"
         ;;
+    broadcast)
+        shift
+        if [ $# -lt 1 ]; then
+            echo "Usage: swarm broadcast <message>" >&2
+            exit 1
+        fi
+        cmd_broadcast "$@"
+        ;;
     inbox)
         shift
         cmd_inbox "$@"
@@ -2969,6 +3023,7 @@ Commands:
   collect <target>                  Get last assistant response
   status                            Dashboard of all agents
   send <target> <message>           Send async message to agent's inbox
+  broadcast <message>               Send message to all idle agents
   inbox [--peek] [--target <pane>]  Read (and clear) inbox messages
   ask <target> "question"           Send QA question (creates tracked QA record)
   reply <qa_id> "answer"            Reply to a QA question
