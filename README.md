@@ -5,6 +5,11 @@
 <h1 align="center">CC Swarm</h1>
 
 <p align="center">
+  <a href="https://github.com/x-zheng16/cc-swarm"><img src="https://img.shields.io/github/stars/x-zheng16/cc-swarm?style=social" alt="GitHub stars"></a>
+  <a href="https://github.com/x-zheng16/cc-swarm"><img src="https://img.shields.io/github/forks/x-zheng16/cc-swarm?style=social" alt="GitHub forks"></a>
+</p>
+
+<p align="center">
   Peer-mesh multi-agent coordination for <a href="https://github.com/anthropics/claude-code">Claude Code</a> over tmux
 </p>
 
