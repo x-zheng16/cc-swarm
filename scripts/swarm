@@ -1075,9 +1075,9 @@ cmd_send() {
     # Push notification via tmux send-keys -l (literal, avoids glob on bracket targets)
     if $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
         local notify_msg="[swarm:$sender] $message"
-        $TMUX_BIN send-keys -t "$target" -l "$notify_msg" 2>/dev/null
+        $TMUX_BIN send-keys -t "$target" -l "$notify_msg" 2>/dev/null || true
         sleep 0.3
-        $TMUX_BIN send-keys -t "$target" Enter 2>/dev/null
+        $TMUX_BIN send-keys -t "$target" Enter 2>/dev/null || true
     fi
 
     log_activity "send" "target=$target" "from=$sender"
@@ -1122,8 +1122,9 @@ cmd_broadcast() {
             continue
         fi
 
-        cmd_send "$pane" "$message"
-        sent=$((sent + 1))
+        if cmd_send "$pane" "$message" 2>/dev/null; then
+            sent=$((sent + 1))
+        fi
     done
 
     log_activity "broadcast" "sent=$sent" "skipped_busy=$skipped_busy"
@@ -2756,11 +2757,8 @@ cmd_rename() {
         exit 1
     fi
 
-    # Extract window_name by stripping [prefix] if present
+    # window_name = full name including [prefix] (preserved for targeting)
     local window_name="$name"
-    if [[ "$name" =~ ^\[.*\]\ (.+)$ ]]; then
-        window_name="${BASH_REMATCH[1]}"
-    fi
 
     # Determine pane target and session info
     local pane_target="" session_name="" pane_index=""
@@ -2789,7 +2787,7 @@ cmd_rename() {
         $TMUX_BIN send-keys -t "$target" "/rename $name" Enter
 
         # Layer 2: tmux window name (immediate, no hook wait)
-        $TMUX_BIN rename-window -t "$target" "$window_name"
+        $TMUX_BIN rename-window -t "$target" -- "$window_name"
 
         pane_target="${session_name}:${window_name}.${pane_index}"
     else
