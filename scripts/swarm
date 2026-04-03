@@ -440,11 +440,11 @@ cmd_dispatch() {
     fi
 
     # Remove old notification footer before appending updated one
-    if $force && grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
+    if $force && rg -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
         sed -i '' '/^---$/,/^```$/{ /swarm send.*done: '"$task_id"'/{ N; d; }; }' "$task_dir/prompt.md" 2>/dev/null || true
     fi
 
-    if ! grep -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
+    if ! rg -q "swarm send.*done: $task_id" "$task_dir/prompt.md" 2>/dev/null; then
         cat >> "$task_dir/prompt.md" <<NOTIFY
 
 ---
@@ -573,7 +573,7 @@ cmd_monitor() {
 
                 # Progress indicator
                 local last_line
-                last_line=$($TMUX_BIN capture-pane -t "$target" -p 2>/dev/null | grep -v '^$' | tail -1)
+                last_line=$($TMUX_BIN capture-pane -t "$target" -p 2>/dev/null | rg -v '^$' | tail -1)
                 printf "\r[%4ds] %-80s" "$elapsed" "${last_line:0:80}"
             done
             ;;
@@ -691,7 +691,7 @@ cmd_status() {
 
         # Get last non-empty line as activity indicator
         local last_line
-        last_line=$($TMUX_BIN capture-pane -t "$target" -p 2>/dev/null | grep -v '^$' | grep -vE 'bypass|permissions|shift.tab' | tail -1 || echo "")
+        last_line=$($TMUX_BIN capture-pane -t "$target" -p 2>/dev/null | rg -v '^$' | rg -v 'bypass|permissions|shift.tab' | tail -1 || echo "")
         last_line="${last_line:0:25}"
 
         local display_cwd="${pane_path/#$HOME/~}"
@@ -768,7 +768,7 @@ cmd_register_all() {
 
                 # If only one candidate, use it
                 local num_candidates
-                num_candidates=$(echo "$candidates" | grep -c . || echo 0)
+                num_candidates=$(echo "$candidates" | rg -c '.' || echo 0)
                 if [ "$num_candidates" -eq 1 ]; then
                     session_id=$(echo "$candidates" | awk '{print $2}')
                 elif [ "$num_candidates" -le 5 ]; then
@@ -777,7 +777,7 @@ cmd_register_all() {
                         local already_taken=false
                         for regfile in "$AGENTS_DIR"/*.json; do
                             [ -f "$regfile" ] || continue
-                            if jq -r '.session_id' "$regfile" 2>/dev/null | grep -q "^${sid}$"; then
+                            if jq -r '.session_id' "$regfile" 2>/dev/null | rg -q "^${sid}$"; then
                                 already_taken=true
                                 break
                             fi
@@ -1068,19 +1068,38 @@ cmd_send() {
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+    # Check if target agent is registered
+    local agent_registered=false
+    for card in "$AGENTS_DIR"/*.json; do
+        [ -f "$card" ] || continue
+        local card_pane
+        card_pane=$(jq -r '.pane // ""' "$card" 2>/dev/null)
+        if [ "$card_pane" = "$target" ]; then
+            agent_registered=true
+            break
+        fi
+    done
+
     # Append message to target's inbox
     printf '%s\n' "$(jq -nc --arg from "$sender" --arg to "$target" --arg msg "$message" --arg ts "$timestamp" \
         '{from: $from, to: $to, message: $msg, timestamp: $ts}')" >> "$inbox_file"
 
     # Push notification via tmux send-keys -l (literal, avoids glob on bracket targets)
+    local push_sent=false
     if $TMUX_BIN has-session -t "${target%%:*}" 2>/dev/null; then
         local notify_msg="[swarm:$sender] $message"
-        $TMUX_BIN send-keys -t "$target" -l "$notify_msg" 2>/dev/null || true
-        sleep 0.3
-        $TMUX_BIN send-keys -t "$target" Enter 2>/dev/null || true
+        if $TMUX_BIN send-keys -t "$target" -l "$notify_msg" 2>/dev/null; then
+            sleep 0.3
+            $TMUX_BIN send-keys -t "$target" Enter 2>/dev/null || true
+            push_sent=true
+        fi
     fi
 
-    log_activity "send" "target=$target" "from=$sender"
+    log_activity "send" "target=$target" "from=$sender" "registered=$agent_registered" "push=$push_sent"
+
+    if [ "$agent_registered" = false ]; then
+        echo "Warning: $target is not a registered agent (message written to mailbox but may not be read)" >&2
+    fi
     echo "Message sent to $target (from $sender)"
 }
 
@@ -2332,16 +2351,16 @@ cmd_triage() {
 
     while IFS= read -r line; do
         # Detect severity header
-        if echo "$line" | grep -qiE '^###\s+Critical'; then
+        if echo "$line" | rg -qi '^###\s+Critical'; then
             current_severity="critical"
             continue
-        elif echo "$line" | grep -qiE '^###\s+Important'; then
+        elif echo "$line" | rg -qi '^###\s+Important'; then
             current_severity="important"
             continue
-        elif echo "$line" | grep -qiE '^###\s+(Minor|Nice)'; then
+        elif echo "$line" | rg -qi '^###\s+(Minor|Nice)'; then
             current_severity="minor"
             continue
-        elif echo "$line" | grep -qE '^##[^#]'; then
+        elif echo "$line" | rg -q '^##[^#]'; then
             # New section -- reset severity context
             current_severity=""
             continue
@@ -2349,9 +2368,9 @@ cmd_triage() {
 
         # Skip non-table lines and header/separator rows
         if [ -z "$current_severity" ]; then continue; fi
-        if ! echo "$line" | grep -q '|'; then continue; fi
-        if echo "$line" | grep -qE '^\|\s*[-]+'; then continue; fi
-        if echo "$line" | grep -qiE '^\|\s*#\s*\|'; then continue; fi
+        if ! echo "$line" | rg -q '\|'; then continue; fi
+        if echo "$line" | rg -q '^\|\s*[-]+'; then continue; fi
+        if echo "$line" | rg -qi '^\|\s*#\s*\|'; then continue; fi
 
         # Parse table row: | id | confidence | location | issue |
         local issue_id confidence location description
@@ -2410,7 +2429,7 @@ cmd_triage() {
             local ticket_id
             ticket_id=$("$linear_bin" i create "$clean_desc" \
                 --priority "$priority" \
-                2>/dev/null | grep -oE '[A-Z]+-[0-9]+' | head -1)
+                2>/dev/null | rg -o '[A-Z]+-[0-9]+' | head -1)
 
             if [ -n "$ticket_id" ]; then
                 printf "  %-10s %-6s -> %s (P%d)\n" "$sev_upper" "$issue_id" "$ticket_id" "$priority"
@@ -2520,14 +2539,14 @@ cmd_merge() {
             conflict_branches+=("$branch")
             # Extract conflicted file names
             local conflicts
-            conflicts=$(echo "$merge_output" | grep "^CONFLICT" | sed 's/.*Merge conflict in /  - /' | sed 's/CONFLICT (\([^)]*\)): .*/  - \1 conflict/')
+            conflicts=$(echo "$merge_output" | rg "^CONFLICT" | sed 's/.*Merge conflict in /  - /' | sed 's/CONFLICT (\([^)]*\)): .*/  - \1 conflict/')
             if [ -z "$conflicts" ]; then
-                conflicts=$(echo "$merge_output" | grep -v "^[0-9a-f]" | head -5)
+                conflicts=$(echo "$merge_output" | rg -v "^[0-9a-f]" | head -5)
             fi
             local conflict_file_count
-            conflict_file_count=$(echo "$merge_output" | grep -c "CONFLICT" || true)
+            conflict_file_count=$(echo "$merge_output" | rg -c "CONFLICT" || true)
             printf "  [CONFLICT] %-20s %s conflicted file(s):\n" "$branch" "$conflict_file_count"
-            echo "$merge_output" | grep "CONFLICT" | while read -r cline; do
+            echo "$merge_output" | rg "CONFLICT" | while read -r cline; do
                 local cfile
                 cfile=$(echo "$cline" | sed 's/.*Merge conflict in //' | sed 's/CONFLICT.*//')
                 if [ -n "$cfile" ]; then
@@ -2673,7 +2692,7 @@ cmd_monitor_start() {
     # Find the monitor pane
     local monitor_target=""
     monitor_target=$($TMUX_BIN list-panes -t "${session}" -a -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null \
-        | grep ':monitor\.' | head -1)
+        | rg ':monitor\.' | head -1)
 
     if [ -z "$monitor_target" ]; then
         monitor_target=$($TMUX_BIN list-panes -t "${session}" -a -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null \
