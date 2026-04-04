@@ -58,6 +58,50 @@ SAFE_NAME=$(echo "$PANE_TARGET" | tr ':.' '_')
 
 EVENT="${SWARM_EVENT:-SessionStart}"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# On Stop: delete this agent's card and prune stale cards, then exit
+if [ "$EVENT" = "Stop" ]; then
+    SAFE_NAME=$(echo "$PANE_TARGET" | tr ':.' '_')
+    rm -f "$AGENTS_DIR/${SAFE_NAME}.json"
+    # Also delete any card with matching session_id (handles renamed cards)
+    for old_card in "$AGENTS_DIR"/*.json; do
+        [ -f "$old_card" ] || continue
+        old_sid=$(jq -r '.session_id // empty' "$old_card" 2>/dev/null)
+        if [ "$old_sid" = "$SESSION_ID" ]; then
+            rm -f "$old_card"
+        fi
+    done
+    exit 0
+fi
+
+# Periodic stale card pruning: on every hook fire, remove cards whose pane is dead.
+# Rate-limit: only run if last prune was >60s ago (avoid slowing down every prompt).
+PRUNE_MARKER="$SWARM_DIR/.last_card_prune"
+should_prune=false
+if [ ! -f "$PRUNE_MARKER" ]; then
+    should_prune=true
+else
+    last_prune=$(stat -f %m "$PRUNE_MARKER" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if [ $((now - last_prune)) -gt 60 ]; then
+        should_prune=true
+    fi
+fi
+if [ "$should_prune" = true ]; then
+    touch "$PRUNE_MARKER"
+    # Build set of all live pane targets (session:window.pane_index)
+    live_panes=$($TMUX_BIN list-panes -a -F '#{session_name}:#{window_name}.#{pane_index}' 2>/dev/null || echo "")
+    for card in "$AGENTS_DIR"/*.json; do
+        [ -f "$card" ] || continue
+        card_pane=$(jq -r '.pane // empty' "$card" 2>/dev/null)
+        [ -z "$card_pane" ] && continue
+        # Check exact pane target match against live panes
+        if ! echo "$live_panes" | grep -qxF "$card_pane"; then
+            rm -f "$card"
+        fi
+    done
+fi
+
 # Status is primarily read from pane_title (✳=idle, ⠂/⠐=busy) by swarm CLI.
 # Card status is a secondary record for offline/historical use only.
 STATUS="idle"
